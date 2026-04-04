@@ -1,3 +1,7 @@
+use discern::config::AppConfig;
+use discern::runtime::bootstrap;
+
 fn main() {
-    println!("discern bootstrap");
+    let runtime = bootstrap(AppConfig::default()).expect("default runtime config should be valid");
+    println!("{}", runtime.startup_summary());
 }
