@@ -17,10 +17,10 @@ impl Runtime {
     pub fn startup_summary(&self) -> String {
         format!(
             "discern runtime ready: db={}, api={}, web={} ({})",
-            self.infrastructure.sqlite.database_path,
+            self.infrastructure.sqlite.database_path.display(),
             self.api.base_path,
             self.web.mount_path,
-            self.web.asset_dir
+            self.web.asset_dir.display()
         )
     }
 }
@@ -58,7 +58,10 @@ mod tests {
 
         assert_eq!(runtime.api.base_path, "/api");
         assert_eq!(runtime.web.mount_path, "/");
-        assert_eq!(runtime.infrastructure.sqlite.database_path, "discern.db");
+        assert_eq!(
+            runtime.infrastructure.sqlite.database_path,
+            std::path::PathBuf::from("discern.db")
+        );
     }
 
     #[test]

@@ -1,9 +1,11 @@
+use std::path::PathBuf;
+
 use crate::config::WebConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSurface {
     pub mount_path: String,
-    pub asset_dir: String,
+    pub asset_dir: PathBuf,
 }
 
 impl WebSurface {
