@@ -1,3 +1,7 @@
+use crate::domain::candidate_match::{
+    CandidateMatch, CandidateProvider, CandidateScore, CandidateSubject, EvidenceKind,
+    EvidenceNote, ProviderProvenance,
+};
 use crate::domain::config_snapshot::ConfigSnapshot;
 use crate::domain::exported_metadata_snapshot::{
     CompatibilityReport, ExportedMetadataSnapshot, QualifierVisibility,
@@ -18,9 +22,9 @@ use crate::domain::source::{Source, SourceKind, SourceLocator};
 use crate::domain::track::{Track, TrackPosition};
 use crate::domain::track_instance::{AudioProperties, TrackInstance};
 use crate::support::ids::{
-    ArtistId, ConfigSnapshotId, ExportedMetadataSnapshotId, FileId, ImportBatchId, IssueId, JobId,
-    ManualOverrideId, ReleaseArtworkId, ReleaseGroupId, ReleaseId, ReleaseInstanceId, SourceId,
-    TrackId, TrackInstanceId,
+    ArtistId, CandidateMatchId, ConfigSnapshotId, ExportedMetadataSnapshotId, FileId,
+    ImportBatchId, IssueId, JobId, ManualOverrideId, ReleaseArtworkId, ReleaseGroupId, ReleaseId,
+    ReleaseInstanceId, SourceId, TrackId, TrackInstanceId,
 };
 
 #[test]
@@ -234,4 +238,47 @@ fn exported_and_operator_state_attach_without_leaking_persistence_details() {
     assert_eq!(override_record.subject, OverrideSubject::Track(track_id));
     assert_eq!(artwork.release_id, release_id);
     assert_eq!(config.release_instance_id, Some(release_instance_id));
+}
+
+#[test]
+fn candidate_matches_attach_to_release_instance_with_scored_evidence() {
+    let release_instance_id = ReleaseInstanceId::new();
+    let candidate = CandidateMatch {
+        id: CandidateMatchId::new(),
+        release_instance_id: release_instance_id.clone(),
+        provider: CandidateProvider::MusicBrainz,
+        subject: CandidateSubject::Release {
+            provider_id: "mb-release-123".to_string(),
+        },
+        normalized_score: CandidateScore::new(0.94),
+        evidence_matches: vec![
+            EvidenceNote {
+                kind: EvidenceKind::ArtistMatch,
+                detail: "artist matched exactly".to_string(),
+            },
+            EvidenceNote {
+                kind: EvidenceKind::TrackCountMatch,
+                detail: "track count matched 10 tracks".to_string(),
+            },
+        ],
+        mismatches: vec![EvidenceNote {
+            kind: EvidenceKind::DateProximity,
+            detail: "source tags suggest a later reissue".to_string(),
+        }],
+        unresolved_ambiguities: vec!["2011 CD and 2012 repress remain close".to_string()],
+        provider_provenance: ProviderProvenance {
+            provider_name: "musicbrainz".to_string(),
+            query: "artist=Radiohead album=Kid A".to_string(),
+            fetched_at_unix_seconds: 1_712_288_400,
+        },
+    };
+
+    assert_eq!(candidate.release_instance_id, release_instance_id);
+    assert_eq!(candidate.normalized_score.value(), 0.94);
+    assert!(matches!(
+        candidate.subject,
+        CandidateSubject::Release { .. }
+    ));
+    assert_eq!(candidate.evidence_matches.len(), 2);
+    assert_eq!(candidate.mismatches.len(), 1);
 }

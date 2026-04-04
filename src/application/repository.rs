@@ -1,0 +1,157 @@
+use crate::domain::candidate_match::CandidateMatch;
+use crate::domain::exported_metadata_snapshot::ExportedMetadataSnapshot;
+use crate::domain::import_batch::ImportBatch;
+use crate::domain::issue::{Issue, IssueState, IssueType};
+use crate::domain::job::{Job, JobStatus, JobType};
+use crate::domain::release::Release;
+use crate::domain::release_group::ReleaseGroup;
+use crate::domain::release_instance::{FormatFamily, ReleaseInstance, ReleaseInstanceState};
+use crate::support::ids::{
+    CandidateMatchId, ExportedMetadataSnapshotId, ImportBatchId, IssueId, JobId, ReleaseGroupId,
+    ReleaseId, ReleaseInstanceId,
+};
+use crate::support::pagination::{Page, PageRequest};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryError {
+    pub kind: RepositoryErrorKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryErrorKind {
+    NotFound,
+    Conflict,
+    InvalidQuery,
+    Storage,
+}
+
+pub trait ReleaseRepository {
+    fn get_release_group(
+        &self,
+        id: &ReleaseGroupId,
+    ) -> Result<Option<ReleaseGroup>, RepositoryError>;
+
+    fn get_release(&self, id: &ReleaseId) -> Result<Option<Release>, RepositoryError>;
+
+    fn find_release_by_musicbrainz_id(
+        &self,
+        musicbrainz_release_id: &str,
+    ) -> Result<Option<Release>, RepositoryError>;
+
+    fn search_release_groups(
+        &self,
+        query: &ReleaseGroupSearchQuery,
+    ) -> Result<Page<ReleaseGroup>, RepositoryError>;
+
+    fn list_releases(&self, query: &ReleaseListQuery) -> Result<Page<Release>, RepositoryError>;
+}
+
+pub trait ReleaseInstanceRepository {
+    fn get_release_instance(
+        &self,
+        id: &ReleaseInstanceId,
+    ) -> Result<Option<ReleaseInstance>, RepositoryError>;
+
+    fn list_release_instances(
+        &self,
+        query: &ReleaseInstanceListQuery,
+    ) -> Result<Page<ReleaseInstance>, RepositoryError>;
+
+    fn list_candidate_matches(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        page: &PageRequest,
+    ) -> Result<Page<CandidateMatch>, RepositoryError>;
+
+    fn get_candidate_match(
+        &self,
+        id: &CandidateMatchId,
+    ) -> Result<Option<CandidateMatch>, RepositoryError>;
+}
+
+pub trait ImportBatchRepository {
+    fn get_import_batch(&self, id: &ImportBatchId) -> Result<Option<ImportBatch>, RepositoryError>;
+
+    fn list_import_batches(
+        &self,
+        query: &ImportBatchListQuery,
+    ) -> Result<Page<ImportBatch>, RepositoryError>;
+}
+
+pub trait IssueRepository {
+    fn get_issue(&self, id: &IssueId) -> Result<Option<Issue>, RepositoryError>;
+
+    fn list_issues(&self, query: &IssueListQuery) -> Result<Page<Issue>, RepositoryError>;
+}
+
+pub trait JobRepository {
+    fn get_job(&self, id: &JobId) -> Result<Option<Job>, RepositoryError>;
+
+    fn list_jobs(&self, query: &JobListQuery) -> Result<Page<Job>, RepositoryError>;
+}
+
+pub trait ExportRepository {
+    fn get_latest_exported_metadata(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+    ) -> Result<Option<ExportedMetadataSnapshot>, RepositoryError>;
+
+    fn list_exported_metadata(
+        &self,
+        query: &ExportedMetadataListQuery,
+    ) -> Result<Page<ExportedMetadataSnapshot>, RepositoryError>;
+
+    fn get_exported_metadata(
+        &self,
+        id: &ExportedMetadataSnapshotId,
+    ) -> Result<Option<ExportedMetadataSnapshot>, RepositoryError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReleaseGroupSearchQuery {
+    pub text: Option<String>,
+    pub primary_artist_name: Option<String>,
+    pub page: PageRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReleaseListQuery {
+    pub release_group_id: Option<ReleaseGroupId>,
+    pub text: Option<String>,
+    pub page: PageRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReleaseInstanceListQuery {
+    pub release_id: Option<ReleaseId>,
+    pub state: Option<ReleaseInstanceState>,
+    pub format_family: Option<FormatFamily>,
+    pub page: PageRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImportBatchListQuery {
+    pub page: PageRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IssueListQuery {
+    pub state: Option<IssueState>,
+    pub issue_type: Option<IssueType>,
+    pub page: PageRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobListQuery {
+    pub status: Option<JobStatus>,
+    pub job_type: Option<JobType>,
+    pub page: PageRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExportedMetadataListQuery {
+    pub release_instance_id: Option<ReleaseInstanceId>,
+    pub album_title: Option<String>,
+    pub page: PageRequest,
+}

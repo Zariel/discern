@@ -33,6 +33,7 @@ strong_id!(FileId);
 strong_id!(SourceId);
 strong_id!(ImportBatchId);
 strong_id!(MetadataSnapshotId);
+strong_id!(CandidateMatchId);
 strong_id!(ExportedMetadataSnapshotId);
 strong_id!(IssueId);
 strong_id!(JobId);

@@ -1,4 +1,5 @@
 pub mod artist;
+pub mod candidate_match;
 pub mod config_snapshot;
 pub mod exported_metadata_snapshot;
 pub mod file;
