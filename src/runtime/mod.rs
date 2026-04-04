@@ -1,6 +1,6 @@
 use crate::api::ApiSurface;
 use crate::application::ApplicationContext;
-use crate::config::{AppConfig, ConfigError};
+use crate::config::{AppConfig, ConfigValidationReport};
 use crate::infrastructure::Infrastructure;
 use crate::web::WebSurface;
 
@@ -27,12 +27,12 @@ impl Runtime {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeBootstrapError {
-    InvalidConfig(ConfigError),
+    InvalidConfig(ConfigValidationReport),
 }
 
 pub fn bootstrap(config: AppConfig) -> Result<Runtime, RuntimeBootstrapError> {
     config
-        .validate()
+        .validate_startup()
         .map_err(RuntimeBootstrapError::InvalidConfig)?;
 
     let infrastructure = Infrastructure::from_config(&config.storage);
@@ -48,7 +48,7 @@ pub fn bootstrap(config: AppConfig) -> Result<Runtime, RuntimeBootstrapError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{AppConfig, ConfigError};
+    use crate::config::{AppConfig, ConfigValidationIssue, ConfigValidationReport};
 
     use super::{RuntimeBootstrapError, bootstrap};
 
@@ -71,10 +71,14 @@ mod tests {
 
         assert_eq!(
             bootstrap(config),
-            Err(RuntimeBootstrapError::InvalidConfig(ConfigError::new(
-                "api.base_path",
-                "path must start with '/'",
-            )))
+            Err(RuntimeBootstrapError::InvalidConfig(
+                ConfigValidationReport {
+                    errors: vec![ConfigValidationIssue {
+                        field: "api.base_path".to_string(),
+                        message: "path must start with '/'".to_string(),
+                    }],
+                }
+            ))
         );
     }
 }

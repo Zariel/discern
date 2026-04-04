@@ -87,6 +87,36 @@ impl AppConfig {
 
         Ok(())
     }
+
+    pub fn validate_startup(&self) -> Result<(), ConfigValidationReport> {
+        let mut report = ConfigValidationReport::default();
+
+        if let Err(error) = self.validate() {
+            report.push(error.field, error.message);
+        }
+
+        let release_placeholders = validate_template(
+            &mut report,
+            "export.path_templates.release_template",
+            &self.export.path_templates.release_template,
+        );
+        let release_instance_placeholders = validate_template(
+            &mut report,
+            "export.path_templates.release_instance_template",
+            &self.export.path_templates.release_instance_template,
+        );
+
+        validate_watch_directories(self, &mut report);
+        validate_provider_credentials(self, &mut report);
+        validate_distinguishability_rules(
+            self,
+            &release_placeholders,
+            &release_instance_placeholders,
+            &mut report,
+        );
+
+        report.into_result()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,8 +261,8 @@ impl Default for PathTemplateConfig {
     fn default() -> Self {
         Self {
             release_template: "{album_artist}/{release_title}".to_string(),
-            release_instance_template: "{release_year} - {edition_label}/{format_family}"
-                .to_string(),
+            release_instance_template:
+                "{release_year} - {edition_label}/{format_family}-{bitrate_mode}-{bitrate_kbps}-{sample_rate_hz}-{bit_depth}/{source_name}".to_string(),
             character_replacement: "_".to_string(),
             max_path_length: 240,
         }
@@ -307,6 +337,7 @@ impl Default for MusicBrainzConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscogsConfig {
+    pub enabled: bool,
     pub personal_access_token: Option<String>,
     pub rate_limit_per_second: u16,
 }
@@ -314,6 +345,7 @@ pub struct DiscogsConfig {
 impl Default for DiscogsConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             personal_access_token: None,
             rate_limit_per_second: 1,
         }
@@ -396,6 +428,34 @@ impl ConfigError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConfigValidationReport {
+    pub errors: Vec<ConfigValidationIssue>,
+}
+
+impl ConfigValidationReport {
+    pub fn push(&mut self, field: impl Into<String>, message: impl Into<String>) {
+        self.errors.push(ConfigValidationIssue {
+            field: field.into(),
+            message: message.into(),
+        });
+    }
+
+    pub fn into_result(self) -> Result<(), Self> {
+        if self.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(self)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigValidationIssue {
+    pub field: String,
+    pub message: String,
+}
+
 fn validate_base_path(field: &'static str, value: &str) -> Result<(), ConfigError> {
     if !value.starts_with('/') {
         return Err(ConfigError::new(field, "path must start with '/'"));
@@ -411,9 +471,233 @@ fn validate_base_path(field: &'static str, value: &str) -> Result<(), ConfigErro
     Ok(())
 }
 
+fn validate_template(
+    report: &mut ConfigValidationReport,
+    field: &str,
+    template: &str,
+) -> Vec<String> {
+    let mut placeholders = Vec::new();
+    let mut chars = template.char_indices().peekable();
+
+    while let Some((index, current)) = chars.next() {
+        match current {
+            '{' => {
+                let placeholder_start = index + 1;
+                let mut closing_index = None;
+
+                for (candidate_index, candidate) in chars.by_ref() {
+                    if candidate == '}' {
+                        closing_index = Some(candidate_index);
+                        break;
+                    }
+
+                    if candidate == '{' {
+                        report.push(field, "path template contains nested '{'");
+                        return placeholders;
+                    }
+                }
+
+                let Some(closing_index) = closing_index else {
+                    report.push(field, "path template contains an unclosed placeholder");
+                    return placeholders;
+                };
+
+                let placeholder = &template[placeholder_start..closing_index];
+
+                if !is_known_template_placeholder(placeholder) {
+                    report.push(
+                        field,
+                        format!("path template uses unknown placeholder '{placeholder}'"),
+                    );
+                    continue;
+                }
+
+                placeholders.push(placeholder.to_string());
+            }
+            '}' => {
+                report.push(field, "path template contains an unmatched '}'");
+                return placeholders;
+            }
+            _ => {}
+        }
+    }
+
+    placeholders
+}
+
+fn is_known_template_placeholder(placeholder: &str) -> bool {
+    matches!(
+        placeholder,
+        "album_artist"
+            | "release_title"
+            | "release_year"
+            | "edition_label"
+            | "format_family"
+            | "bitrate_mode"
+            | "bitrate_kbps"
+            | "sample_rate_hz"
+            | "bit_depth"
+            | "source_name"
+    )
+}
+
+fn validate_watch_directories(config: &AppConfig, report: &mut ConfigValidationReport) {
+    let managed_library_root = normalize_path(&config.storage.managed_library_root);
+    let mut normalized_watch_paths = Vec::new();
+
+    for (index, watcher) in config.storage.watch_directories.iter().enumerate() {
+        let normalized = normalize_path(&watcher.path);
+        let field = format!("storage.watch_directories[{index}].path");
+
+        if paths_overlap(&managed_library_root, &normalized) {
+            report.push(
+                field.clone(),
+                "watch directory must not overlap the managed library root",
+            );
+        }
+
+        if matches!(watcher.import_mode_override, Some(ImportMode::Move))
+            && paths_overlap(&managed_library_root, &normalized)
+        {
+            report.push(
+                format!("storage.watch_directories[{index}].import_mode_override"),
+                "move mode is not supported when a watch directory overlaps the managed library root",
+            );
+        }
+
+        normalized_watch_paths.push((field, normalized));
+    }
+
+    for left_index in 0..normalized_watch_paths.len() {
+        for right_index in (left_index + 1)..normalized_watch_paths.len() {
+            let (left_field, left_path) = &normalized_watch_paths[left_index];
+            let (right_field, right_path) = &normalized_watch_paths[right_index];
+
+            if paths_overlap(left_path, right_path) {
+                report.push(
+                    left_field.clone(),
+                    format!("watch directory overlaps with {right_field}"),
+                );
+                report.push(
+                    right_field.clone(),
+                    format!("watch directory overlaps with {left_field}"),
+                );
+            }
+        }
+    }
+}
+
+fn validate_provider_credentials(config: &AppConfig, report: &mut ConfigValidationReport) {
+    if config.providers.discogs.enabled
+        && config
+            .providers
+            .discogs
+            .personal_access_token
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        report.push(
+            "providers.discogs.personal_access_token",
+            "discogs requires a personal access token when enabled",
+        );
+    }
+}
+
+fn validate_distinguishability_rules(
+    config: &AppConfig,
+    release_placeholders: &[String],
+    release_instance_placeholders: &[String],
+    report: &mut ConfigValidationReport,
+) {
+    let has_release_edition = has_placeholder(release_placeholders, "edition_label");
+    let has_instance_edition = has_placeholder(release_instance_placeholders, "edition_label");
+    let has_source_name = has_placeholder(release_instance_placeholders, "source_name");
+    let has_format_family = has_placeholder(release_instance_placeholders, "format_family");
+    let has_quality_detail = has_any_placeholder(
+        release_instance_placeholders,
+        &[
+            "bitrate_mode",
+            "bitrate_kbps",
+            "sample_rate_hz",
+            "bit_depth",
+        ],
+    );
+
+    for profile in &config.export.profiles {
+        if matches!(profile.edition_visibility, EditionVisibilityPolicy::Hidden)
+            && !has_release_edition
+            && !has_instance_edition
+        {
+            report.push(
+                format!("export.profiles[{}].edition_visibility", profile.name),
+                "edition visibility is hidden, but no path template includes {edition_label}",
+            );
+        }
+
+        if matches!(
+            profile.provenance_visibility,
+            VariantVisibilityPolicy::Hidden
+        ) && config.import.duplicate_policy == DuplicatePolicy::AllowIfDistinguishable
+            && !has_source_name
+        {
+            report.push(
+                format!("export.profiles[{}].provenance_visibility", profile.name),
+                "duplicate coexistence requires {source_name} in the release instance path when provenance is hidden from tags",
+            );
+        }
+
+        if !has_format_family || !has_quality_detail {
+            report.push(
+                format!("export.profiles[{}].technical_visibility", profile.name),
+                "release instance paths must include format_family and at least one bitrate or quality placeholder",
+            );
+        }
+    }
+}
+
+fn has_placeholder(placeholders: &[String], placeholder: &str) -> bool {
+    placeholders
+        .iter()
+        .any(|candidate| candidate == placeholder)
+}
+
+fn has_any_placeholder(placeholders: &[String], wanted: &[&str]) -> bool {
+    placeholders
+        .iter()
+        .any(|candidate| wanted.iter().any(|wanted| candidate == wanted))
+}
+
+fn normalize_path(path: &std::path::Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
+    normalized
+}
+
+fn paths_overlap(left: &std::path::Path, right: &std::path::Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, ConfigError, UnknownTagPolicy};
+    use std::path::PathBuf;
+
+    use crate::domain::import_batch::ImportMode;
+
+    use super::{
+        AppConfig, ConfigError, ConfigValidationIssue, ConfigValidationReport,
+        EditionVisibilityPolicy, UnknownTagPolicy, VariantVisibilityPolicy, WatchDirectoryConfig,
+        WatchScanMode,
+    };
 
     #[test]
     fn default_config_is_valid() {
@@ -488,6 +772,135 @@ mod tests {
                 "workers.max_concurrent_jobs",
                 "worker concurrency must be greater than zero",
             ))
+        );
+    }
+
+    #[test]
+    fn startup_validation_rejects_overlapping_watch_directories() {
+        let mut config = AppConfig::default();
+        config.storage.watch_directories[0].path = PathBuf::from("/music/incoming");
+        config.storage.watch_directories.push(WatchDirectoryConfig {
+            name: "nested".to_string(),
+            path: PathBuf::from("/music/incoming/subdir"),
+            scan_mode: WatchScanMode::EventDriven,
+            import_mode_override: None,
+        });
+
+        assert_eq!(
+            config.validate_startup(),
+            Err(ConfigValidationReport {
+                errors: vec![
+                    ConfigValidationIssue {
+                        field: "storage.watch_directories[0].path".to_string(),
+                        message: "watch directory overlaps with storage.watch_directories[1].path"
+                            .to_string(),
+                    },
+                    ConfigValidationIssue {
+                        field: "storage.watch_directories[1].path".to_string(),
+                        message: "watch directory overlaps with storage.watch_directories[0].path"
+                            .to_string(),
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn startup_validation_rejects_unknown_template_placeholders() {
+        let mut config = AppConfig::default();
+        config.export.path_templates.release_template =
+            "{album_artist}/{unsupported_token}".to_string();
+
+        assert_eq!(
+            config.validate_startup(),
+            Err(ConfigValidationReport {
+                errors: vec![ConfigValidationIssue {
+                    field: "export.path_templates.release_template".to_string(),
+                    message: "path template uses unknown placeholder 'unsupported_token'"
+                        .to_string(),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn startup_validation_rejects_hidden_edition_without_path_qualifier() {
+        let mut config = AppConfig::default();
+        config.export.profiles[0].edition_visibility = EditionVisibilityPolicy::Hidden;
+        config.export.path_templates.release_instance_template =
+            "{release_year}/{format_family}-{bitrate_mode}-{bitrate_kbps}/{source_name}"
+                .to_string();
+
+        assert_eq!(
+            config.validate_startup(),
+            Err(ConfigValidationReport {
+                errors: vec![ConfigValidationIssue {
+                    field: "export.profiles[generic_player].edition_visibility".to_string(),
+                    message:
+                        "edition visibility is hidden, but no path template includes {edition_label}"
+                            .to_string(),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn startup_validation_rejects_duplicate_allowance_without_source_qualifier() {
+        let mut config = AppConfig::default();
+        config.export.path_templates.release_instance_template =
+            "{release_year} - {edition_label}/{format_family}-{bitrate_mode}-{bitrate_kbps}"
+                .to_string();
+        config.export.profiles[0].provenance_visibility = VariantVisibilityPolicy::Hidden;
+
+        assert_eq!(
+            config.validate_startup(),
+            Err(ConfigValidationReport {
+                errors: vec![ConfigValidationIssue {
+                    field: "export.profiles[generic_player].provenance_visibility".to_string(),
+                    message: "duplicate coexistence requires {source_name} in the release instance path when provenance is hidden from tags".to_string(),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn startup_validation_rejects_enabled_discogs_without_token() {
+        let mut config = AppConfig::default();
+        config.providers.discogs.enabled = true;
+
+        assert_eq!(
+            config.validate_startup(),
+            Err(ConfigValidationReport {
+                errors: vec![ConfigValidationIssue {
+                    field: "providers.discogs.personal_access_token".to_string(),
+                    message: "discogs requires a personal access token when enabled".to_string(),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn startup_validation_rejects_watch_directory_overlap_with_library_root() {
+        let mut config = AppConfig::default();
+        config.storage.managed_library_root = PathBuf::from("/music/library");
+        config.storage.watch_directories[0].path = PathBuf::from("/music");
+        config.storage.watch_directories[0].import_mode_override = Some(ImportMode::Move);
+
+        assert_eq!(
+            config.validate_startup(),
+            Err(ConfigValidationReport {
+                errors: vec![
+                    ConfigValidationIssue {
+                        field: "storage.watch_directories[0].path".to_string(),
+                        message: "watch directory must not overlap the managed library root"
+                            .to_string(),
+                    },
+                    ConfigValidationIssue {
+                        field: "storage.watch_directories[0].import_mode_override".to_string(),
+                        message: "move mode is not supported when a watch directory overlaps the managed library root".to_string(),
+                    },
+                ],
+            })
         );
     }
 }
