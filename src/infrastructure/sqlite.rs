@@ -1366,7 +1366,7 @@ mod tests {
     };
     use crate::domain::issue::IssueState;
     use crate::domain::job::JobStatus;
-    use crate::domain::release_instance::ReleaseInstanceState;
+    use crate::domain::release_instance::{FormatFamily, ReleaseInstanceState};
     use uuid::Uuid;
 
     #[test]
@@ -1381,53 +1381,145 @@ mod tests {
     }
 
     #[test]
-    fn repositories_read_release_and_candidate_data() {
+    fn migrations_apply_and_rollback_cleanly() {
+        let database_path =
+            std::env::temp_dir().join(format!("discern-test-{}.db", Uuid::new_v4()));
+        let context = SqliteRepositoryContext::open(&database_path).expect("context should open");
+
+        context
+            .with_write_transaction(|transaction| {
+                apply_migrations(transaction)?;
+                Ok(())
+            })
+            .expect("migrations should apply");
+
+        let connection = context.read_connection().expect("reader should open");
+        let tables = sqlite_tables(&connection);
+        assert!(tables.contains(&"release_instances".to_string()));
+        assert!(tables.contains(&"jobs".to_string()));
+
+        connection
+            .execute_batch(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/migrations/0002_indexes.down.sql"
+            )))
+            .expect("index rollback should succeed");
+        connection
+            .execute_batch(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/migrations/0001_initial_schema.down.sql"
+            )))
+            .expect("schema rollback should succeed");
+
+        assert!(sqlite_tables(&connection).is_empty());
+    }
+
+    #[test]
+    fn migrations_create_expected_indexes() {
+        let (context, _path) = seeded_context();
+        let connection = context.read_connection().expect("reader should open");
+        let release_instance_indexes = sqlite_index_names(&connection, "release_instances");
+        let issue_indexes = sqlite_index_names(&connection, "issues");
+
+        assert!(release_instance_indexes.contains(&"idx_release_instances_release_id".to_string()));
+        assert!(
+            release_instance_indexes.contains(&"idx_release_instances_source_path".to_string())
+        );
+        assert!(issue_indexes.contains(&"idx_issues_state_type".to_string()));
+    }
+
+    #[test]
+    fn repositories_return_none_for_missing_records() {
+        let (context, _path) = seeded_context();
+        let repositories = SqliteRepositories::new(context);
+        let missing_release: ReleaseId = parse_uuid(SeedIds::UNUSED_RELEASE);
+        let missing_issue: IssueId = parse_uuid(SeedIds::UNUSED_ISSUE);
+        let missing_export: ExportedMetadataSnapshotId = parse_uuid(SeedIds::UNUSED_EXPORT);
+
+        assert_eq!(
+            repositories
+                .get_release(&missing_release)
+                .expect("query should succeed"),
+            None
+        );
+        assert_eq!(
+            repositories
+                .get_issue(&missing_issue)
+                .expect("query should succeed"),
+            None
+        );
+        assert_eq!(
+            repositories
+                .get_exported_metadata(&missing_export)
+                .expect("query should succeed"),
+            None
+        );
+    }
+
+    #[test]
+    fn repositories_filter_and_paginate_release_queries() {
         let (context, _path) = seeded_context();
         let repositories = SqliteRepositories::new(context);
 
-        let release_group = repositories
-            .get_release_group(&parse_uuid(SeedIds::RELEASE_GROUP))
-            .expect("query should succeed")
-            .expect("release group should exist");
-        assert_eq!(release_group.title, "In Rainbows");
-        assert_eq!(
-            release_group.musicbrainz_release_group_id,
-            Some(parse_uuid(SeedIds::MB_RELEASE_GROUP))
-        );
+        let release_groups = repositories
+            .search_release_groups(&ReleaseGroupSearchQuery {
+                text: Some("Rain".to_string()),
+                primary_artist_name: Some("Radio".to_string()),
+                page: PageRequest::new(1, 0),
+            })
+            .expect("query should succeed");
+        assert_eq!(release_groups.total, 2);
+        assert!(release_groups.has_more());
+        assert_eq!(release_groups.items.len(), 1);
+        assert_eq!(release_groups.items[0].title, "In Rainbows");
 
-        let release = repositories
-            .find_release_by_musicbrainz_id(SeedIds::MB_RELEASE)
-            .expect("query should succeed")
-            .expect("release should exist");
-        assert_eq!(release.title, "In Rainbows");
+        let releases = repositories
+            .list_releases(&ReleaseListQuery {
+                release_group_id: Some(parse_uuid(SeedIds::RELEASE_GROUP)),
+                text: Some("Rain".to_string()),
+                page: PageRequest::new(10, 0),
+            })
+            .expect("query should succeed");
+        assert_eq!(releases.total, 1);
+        assert_eq!(releases.items[0].title, "In Rainbows");
+    }
+
+    #[test]
+    fn repositories_filter_and_paginate_candidate_matches() {
+        let (context, _path) = seeded_context();
+        let repositories = SqliteRepositories::new(context);
 
         let page = repositories
             .list_candidate_matches(
                 &parse_uuid(SeedIds::RELEASE_INSTANCE),
-                &PageRequest::new(10, 0),
+                &PageRequest::new(1, 0),
             )
             .expect("query should succeed");
-        assert_eq!(page.total, 1);
+        assert_eq!(page.total, 2);
+        assert!(page.has_more());
         assert_eq!(page.items[0].provider, CandidateProvider::MusicBrainz);
         assert_eq!(page.items[0].normalized_score.value(), 0.98);
     }
 
     #[test]
-    fn repositories_read_release_instances_and_exports() {
+    fn repositories_filter_release_instances_and_exports() {
         let (context, _path) = seeded_context();
         let repositories = SqliteRepositories::new(context);
 
         let instances = repositories
             .list_release_instances(&ReleaseInstanceListQuery {
                 state: Some(ReleaseInstanceState::Matched),
+                format_family: Some(FormatFamily::Flac),
+                page: PageRequest::new(1, 0),
                 ..ReleaseInstanceListQuery::default()
             })
             .expect("query should succeed");
-        assert_eq!(instances.total, 1);
+        assert_eq!(instances.total, 2);
         assert_eq!(
             instances.items[0].technical_variant.format_family,
             FormatFamily::Flac
         );
+        assert!(instances.has_more());
 
         let exported = repositories
             .get_latest_exported_metadata(&parse_uuid(SeedIds::RELEASE_INSTANCE))
@@ -1435,10 +1527,20 @@ mod tests {
             .expect("snapshot should exist");
         assert_eq!(exported.album_title, "In Rainbows [2007 CD]");
         assert!(exported.compatibility.verified);
+
+        let exports = repositories
+            .list_exported_metadata(&ExportedMetadataListQuery {
+                album_title: Some("Rainbows".to_string()),
+                page: PageRequest::new(1, 0),
+                ..ExportedMetadataListQuery::default()
+            })
+            .expect("query should succeed");
+        assert_eq!(exports.total, 2);
+        assert!(exports.has_more());
     }
 
     #[test]
-    fn repositories_read_issues_jobs_and_import_batches() {
+    fn repositories_filter_issues_jobs_and_import_batches() {
         let (context, _path) = seeded_context();
         let repositories = SqliteRepositories::new(context);
 
@@ -1460,6 +1562,12 @@ mod tests {
         assert_eq!(jobs.total, 1);
         assert_eq!(jobs.items[0].progress_phase, "queued");
 
+        let batches = repositories
+            .list_import_batches(&ImportBatchListQuery {
+                page: PageRequest::new(10, 0),
+            })
+            .expect("query should succeed");
+        assert_eq!(batches.total, 2);
         let batch = repositories
             .get_import_batch(&parse_uuid(SeedIds::IMPORT_BATCH))
             .expect("query should succeed")
@@ -1476,19 +1584,7 @@ mod tests {
         let context = SqliteRepositoryContext::open(&database_path).expect("context should open");
         context
             .with_write_transaction(|transaction| {
-                transaction
-                    .execute_batch(include_str!(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/migrations/0001_initial_schema.up.sql"
-                    )))
-                    .map_err(to_storage_error)?;
-                transaction
-                    .execute_batch(include_str!(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/migrations/0002_indexes.up.sql"
-                    )))
-                    .map_err(to_storage_error)?;
-
+                apply_migrations(transaction)?;
                 seed_rows(transaction)?;
                 Ok(())
             })
@@ -1522,6 +1618,20 @@ mod tests {
             .map_err(to_storage_error)?;
         transaction
             .execute(
+                "INSERT INTO release_groups
+                 (id, primary_artist_id, title, normalized_title, kind, musicbrainz_release_group_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                params![
+                    SeedIds::SECOND_RELEASE_GROUP,
+                    SeedIds::ARTIST,
+                    "Rainbows Live",
+                    "rainbows live",
+                    "live",
+                ],
+            )
+            .map_err(to_storage_error)?;
+        transaction
+            .execute(
                 "INSERT INTO releases
                  (id, release_group_id, primary_artist_id, title, normalized_title,
                   musicbrainz_release_id, discogs_release_id, edition_title, disambiguation,
@@ -1542,6 +1652,31 @@ mod tests {
                     2007_i64,
                     12_i64,
                     28_i64,
+                ],
+            )
+            .map_err(to_storage_error)?;
+        transaction
+            .execute(
+                "INSERT INTO releases
+                 (id, release_group_id, primary_artist_id, title, normalized_title,
+                  musicbrainz_release_id, discogs_release_id, edition_title, disambiguation,
+                  country, label, catalog_number, release_year, release_month, release_day)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'Live set', ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    SeedIds::SECOND_RELEASE,
+                    SeedIds::SECOND_RELEASE_GROUP,
+                    SeedIds::ARTIST,
+                    "Rainbows Live",
+                    "rainbows live",
+                    SeedIds::SECOND_MB_RELEASE,
+                    54321_u64,
+                    "2018 Digital",
+                    "GB",
+                    "Self Released",
+                    "DIGI001",
+                    2018_i64,
+                    6_i64,
+                    1_i64,
                 ],
             )
             .map_err(to_storage_error)?;
@@ -1570,6 +1705,21 @@ mod tests {
             .map_err(to_storage_error)?;
         transaction
             .execute(
+                "INSERT INTO import_batches
+                 (id, source_id, mode, status, requested_by_kind, requested_by_name, created_at_unix_seconds)
+                 VALUES (?1, ?2, 'hardlink', 'created', 'external_client', 'api', 90)",
+                params![SeedIds::SECOND_IMPORT_BATCH, SeedIds::SOURCE],
+            )
+            .map_err(to_storage_error)?;
+        transaction
+            .execute(
+                "INSERT INTO import_batch_paths (import_batch_id, ordinal, path)
+                 VALUES (?1, 0, '/incoming/radiohead-live')",
+                params![SeedIds::SECOND_IMPORT_BATCH],
+            )
+            .map_err(to_storage_error)?;
+        transaction
+            .execute(
                 "INSERT INTO release_instances
                  (id, release_id, source_id, state, format_family, bitrate_mode, bitrate_kbps,
                   sample_rate_hz, bit_depth, track_count, total_duration_seconds, ingest_origin,
@@ -1579,6 +1729,23 @@ mod tests {
                          10, 2550, 'watch_directory', 'copy', NULL, NULL,
                          '/incoming/radiohead/In Rainbows', 120, 'redacted', '999', '555')",
                 params![SeedIds::RELEASE_INSTANCE, SeedIds::RELEASE, SeedIds::SOURCE],
+            )
+            .map_err(to_storage_error)?;
+        transaction
+            .execute(
+                "INSERT INTO release_instances
+                 (id, release_id, source_id, state, format_family, bitrate_mode, bitrate_kbps,
+                  sample_rate_hz, bit_depth, track_count, total_duration_seconds, ingest_origin,
+                  import_mode, duplicate_status, export_visibility_policy, original_source_path,
+                  imported_at_unix_seconds, gazelle_tracker, gazelle_torrent_id, gazelle_release_group_id)
+                 VALUES (?1, ?2, ?3, 'matched', 'flac', 'constant', 320, 48000, 24,
+                         8, 2100, 'manual_add', 'hardlink', NULL, NULL,
+                         '/incoming/radiohead-live/Rainbows Live', 220, NULL, NULL, NULL)",
+                params![
+                    SeedIds::SECOND_RELEASE_INSTANCE,
+                    SeedIds::SECOND_RELEASE,
+                    SeedIds::SOURCE
+                ],
             )
             .map_err(to_storage_error)?;
         transaction
@@ -1602,6 +1769,24 @@ mod tests {
             .map_err(to_storage_error)?;
         transaction
             .execute(
+                "INSERT INTO candidate_matches
+                 (id, release_instance_id, provider, candidate_kind, provider_entity_id,
+                  normalized_score, evidence_matches_json, mismatches_json,
+                  unresolved_ambiguities_json, provider_provenance_json, created_at_unix_seconds)
+                 VALUES (?1, ?2, 'discogs', 'release_group', 'discogs-rainbows-live', ?3, ?4, ?5, ?6, ?7, 225)",
+                params![
+                    SeedIds::SECOND_CANDIDATE_MATCH,
+                    SeedIds::RELEASE_INSTANCE,
+                    0.67_f64,
+                    r#"[{"kind":"filename_similarity","detail":"folder name loosely matched"}]"#,
+                    r#"[{"kind":"track_count_match","detail":"track count differs"}]"#,
+                    r#"[]"#,
+                    r#"{"provider_name":"discogs","query":"rainbows live","fetched_at_unix_seconds":224}"#,
+                ],
+            )
+            .map_err(to_storage_error)?;
+        transaction
+            .execute(
                 "INSERT INTO exported_metadata_snapshots
                  (id, release_instance_id, export_profile, album_title, album_artist,
                   artist_credits_json, edition_visibility, technical_visibility,
@@ -1620,12 +1805,40 @@ mod tests {
             .map_err(to_storage_error)?;
         transaction
             .execute(
+                "INSERT INTO exported_metadata_snapshots
+                 (id, release_instance_id, export_profile, album_title, album_artist,
+                  artist_credits_json, edition_visibility, technical_visibility,
+                  path_components_json, primary_artwork_filename, compatibility_verified,
+                  compatibility_warnings_json, rendered_at_unix_seconds)
+                 VALUES (?1, ?2, 'generic_player', 'Rainbows Live [2018 Digital]', 'Radiohead',
+                         ?3, 'tags_and_path', 'path_only', ?4, NULL, 0, ?5, 230)",
+                params![
+                    SeedIds::SECOND_EXPORTED_METADATA,
+                    SeedIds::SECOND_RELEASE_INSTANCE,
+                    r#"["Radiohead"]"#,
+                    r#"["Radiohead","Rainbows Live","2018 Digital"]"#,
+                    r#"["artwork missing"]"#,
+                ],
+            )
+            .map_err(to_storage_error)?;
+        transaction
+            .execute(
                 "INSERT INTO issues
                  (id, issue_type, state, subject_kind, subject_id, summary, details,
                   created_at_unix_seconds, resolved_at_unix_seconds, suppressed_reason)
                  VALUES (?1, 'duplicate_release_instance', 'open', 'release_instance', ?2,
                          'Duplicate import detected', 'Review required', 140, NULL, NULL)",
                 params![SeedIds::ISSUE, SeedIds::RELEASE_INSTANCE],
+            )
+            .map_err(to_storage_error)?;
+        transaction
+            .execute(
+                "INSERT INTO issues
+                 (id, issue_type, state, subject_kind, subject_id, summary, details,
+                  created_at_unix_seconds, resolved_at_unix_seconds, suppressed_reason)
+                 VALUES (?1, 'missing_artwork', 'resolved', 'release_instance', ?2,
+                         'Artwork backfilled', 'Handled manually', 141, 160, NULL)",
+                params![SeedIds::SECOND_ISSUE, SeedIds::SECOND_RELEASE_INSTANCE],
             )
             .map_err(to_storage_error)?;
         transaction
@@ -1639,8 +1852,62 @@ mod tests {
                 params![SeedIds::JOB, SeedIds::RELEASE_INSTANCE],
             )
             .map_err(to_storage_error)?;
+        transaction
+            .execute(
+                "INSERT INTO jobs
+                 (id, job_type, subject_kind, subject_id, status, progress_phase,
+                  retry_count, triggered_by, created_at_unix_seconds,
+                  started_at_unix_seconds, finished_at_unix_seconds, error_payload)
+                 VALUES (?1, 'verify_import', 'release_instance', ?2, 'running',
+                         'compatibility', 1, 'operator', 151, 152, NULL, NULL)",
+                params![SeedIds::SECOND_JOB, SeedIds::SECOND_RELEASE_INSTANCE],
+            )
+            .map_err(to_storage_error)?;
 
         Ok(())
+    }
+
+    fn apply_migrations(transaction: &Transaction<'_>) -> Result<(), RepositoryError> {
+        transaction
+            .execute_batch(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/migrations/0001_initial_schema.up.sql"
+            )))
+            .map_err(to_storage_error)?;
+        transaction
+            .execute_batch(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/migrations/0002_indexes.up.sql"
+            )))
+            .map_err(to_storage_error)?;
+        Ok(())
+    }
+
+    fn sqlite_tables(connection: &Connection) -> Vec<String> {
+        let mut statement = connection
+            .prepare(
+                "SELECT name
+                 FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name ASC",
+            )
+            .expect("table query should prepare");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("table query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("table rows should parse")
+    }
+
+    fn sqlite_index_names(connection: &Connection, table: &str) -> Vec<String> {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA index_list('{table}')"))
+            .expect("index query should prepare");
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("index query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("index rows should parse")
     }
 
     fn parse_uuid<T>(value: &str) -> T
@@ -1655,15 +1922,27 @@ mod tests {
     impl SeedIds {
         const ARTIST: &str = "11111111-1111-1111-1111-111111111111";
         const RELEASE_GROUP: &str = "22222222-2222-2222-2222-222222222222";
+        const SECOND_RELEASE_GROUP: &str = "23232323-2323-2323-2323-232323232323";
         const RELEASE: &str = "33333333-3333-3333-3333-333333333333";
+        const SECOND_RELEASE: &str = "34343434-3434-3434-3434-343434343434";
         const SOURCE: &str = "44444444-4444-4444-4444-444444444444";
         const IMPORT_BATCH: &str = "55555555-5555-5555-5555-555555555555";
+        const SECOND_IMPORT_BATCH: &str = "56565656-5656-5656-5656-565656565656";
         const RELEASE_INSTANCE: &str = "66666666-6666-6666-6666-666666666666";
+        const SECOND_RELEASE_INSTANCE: &str = "67676767-6767-6767-6767-676767676767";
         const CANDIDATE_MATCH: &str = "77777777-7777-7777-7777-777777777777";
+        const SECOND_CANDIDATE_MATCH: &str = "78787878-7878-7878-7878-787878787878";
         const EXPORTED_METADATA: &str = "88888888-8888-8888-8888-888888888888";
+        const SECOND_EXPORTED_METADATA: &str = "89898989-8989-8989-8989-898989898989";
         const ISSUE: &str = "99999999-9999-9999-9999-999999999999";
+        const SECOND_ISSUE: &str = "9a9a9a9a-9a9a-9a9a-9a9a-9a9a9a9a9a9a";
         const JOB: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        const SECOND_JOB: &str = "abababab-abab-abab-abab-abababababab";
         const MB_RELEASE_GROUP: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
         const MB_RELEASE: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        const SECOND_MB_RELEASE: &str = "cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd";
+        const UNUSED_RELEASE: &str = "dededede-dede-dede-dede-dededededede";
+        const UNUSED_ISSUE: &str = "efefefef-efef-efef-efef-efefefefefef";
+        const UNUSED_EXPORT: &str = "f0f0f0f0-f0f0-f0f0-f0f0-f0f0f0f0f0f0";
     }
 }
