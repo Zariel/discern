@@ -12,11 +12,12 @@ use crate::application::repository::{
     IngestEvidenceCommandRepository, IngestEvidenceRepository, IssueCommandRepository,
     IssueListQuery, IssueRepository, JobCommandRepository, JobListQuery, JobRepository,
     ManualOverrideCommandRepository, ManualOverrideListQuery, ManualOverrideRepository,
-    MetadataSnapshotCommandRepository, MetadataSnapshotRepository, ReleaseCommandRepository,
-    ReleaseGroupSearchQuery, ReleaseInstanceCommandRepository, ReleaseInstanceListQuery,
-    ReleaseInstanceRepository, ReleaseListQuery, ReleaseRepository, RepositoryError,
-    RepositoryErrorKind, SourceCommandRepository, SourceRepository,
-    StagingManifestCommandRepository, StagingManifestRepository,
+    MetadataSnapshotCommandRepository, MetadataSnapshotRepository, ReleaseArtworkCommandRepository,
+    ReleaseArtworkRepository, ReleaseCommandRepository, ReleaseGroupSearchQuery,
+    ReleaseInstanceCommandRepository, ReleaseInstanceListQuery, ReleaseInstanceRepository,
+    ReleaseListQuery, ReleaseRepository, RepositoryError, RepositoryErrorKind,
+    SourceCommandRepository, SourceRepository, StagingManifestCommandRepository,
+    StagingManifestRepository,
 };
 use crate::domain::artist::Artist;
 use crate::domain::candidate_match::{
@@ -39,6 +40,7 @@ use crate::domain::metadata_snapshot::{
     MetadataSnapshot, MetadataSnapshotSource, MetadataSubject, SnapshotFormat,
 };
 use crate::domain::release::{PartialDate, Release, ReleaseEdition};
+use crate::domain::release_artwork::{ArtworkSource, ReleaseArtwork};
 use crate::domain::release_group::{ReleaseGroup, ReleaseGroupKind};
 use crate::domain::release_instance::{
     BitrateMode, FormatFamily, GazelleReference, IngestOrigin, ProvenanceSnapshot, ReleaseInstance,
@@ -54,8 +56,8 @@ use crate::domain::track_instance::{AudioProperties, TrackInstance};
 use crate::support::ids::{
     ArtistId, CandidateMatchId, DiscogsReleaseId, ExportedMetadataSnapshotId, FileId,
     ImportBatchId, IngestEvidenceId, IssueId, JobId, ManualOverrideId, MetadataSnapshotId,
-    MusicBrainzReleaseGroupId, MusicBrainzReleaseId, ReleaseGroupId, ReleaseId, ReleaseInstanceId,
-    SourceId, StagingManifestId, TrackId, TrackInstanceId,
+    MusicBrainzReleaseGroupId, MusicBrainzReleaseId, ReleaseArtworkId, ReleaseGroupId, ReleaseId,
+    ReleaseInstanceId, SourceId, StagingManifestId, TrackId, TrackInstanceId,
 };
 use crate::support::pagination::{Page, PageRequest};
 
@@ -1975,6 +1977,94 @@ impl ExportCommandRepository for SqliteRepositories {
     }
 }
 
+impl ReleaseArtworkRepository for SqliteRepositories {
+    fn get_release_artwork(
+        &self,
+        id: &ReleaseArtworkId,
+    ) -> Result<Option<ReleaseArtwork>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        connection
+            .query_row(
+                "SELECT id, release_id, release_instance_id, source, is_primary,
+                        original_path, managed_filename, mime_type
+                 FROM release_artwork
+                 WHERE id = ?1",
+                params![id.as_uuid().to_string()],
+                map_release_artwork,
+            )
+            .optional()
+            .map_err(to_storage_error)
+    }
+
+    fn list_release_artwork_for_release_instance(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+    ) -> Result<Vec<ReleaseArtwork>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, release_id, release_instance_id, source, is_primary,
+                        original_path, managed_filename, mime_type
+                 FROM release_artwork
+                 WHERE release_instance_id = ?1
+                 ORDER BY is_primary DESC, id ASC",
+            )
+            .map_err(to_storage_error)?;
+        statement
+            .query_map(
+                params![release_instance_id.as_uuid().to_string()],
+                map_release_artwork,
+            )
+            .map_err(to_storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_storage_error)
+    }
+}
+
+impl ReleaseArtworkCommandRepository for SqliteRepositories {
+    fn replace_release_artwork_for_release_instance(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        artwork: &[ReleaseArtwork],
+    ) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "DELETE FROM release_artwork WHERE release_instance_id = ?1",
+                    params![release_instance_id.as_uuid().to_string()],
+                )
+                .map_err(to_storage_error)?;
+            for artwork in artwork {
+                transaction
+                    .execute(
+                        "INSERT INTO release_artwork
+                         (id, release_id, release_instance_id, source, is_primary,
+                          original_path, managed_filename, mime_type)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            artwork.id.as_uuid().to_string(),
+                            artwork.release_id.as_uuid().to_string(),
+                            artwork
+                                .release_instance_id
+                                .as_ref()
+                                .map(|value| value.as_uuid().to_string()),
+                            artwork_source_to_sql(&artwork.source),
+                            artwork.is_primary,
+                            artwork
+                                .original_path
+                                .as_ref()
+                                .map(|value| value.display().to_string()),
+                            &artwork.managed_filename,
+                            &artwork.mime_type,
+                        ],
+                    )
+                    .map_err(to_storage_error)?;
+            }
+            Ok(())
+        })
+    }
+}
+
 fn configure_connection(connection: &Connection) -> Result<(), RepositoryError> {
     connection
         .busy_timeout(Duration::from_secs(5))
@@ -2445,6 +2535,7 @@ impl_parse_uuid_id!(
     JobId,
     ManualOverrideId,
     MetadataSnapshotId,
+    ReleaseArtworkId,
     ReleaseGroupId,
     ReleaseId,
     ReleaseInstanceId,
@@ -3402,6 +3493,27 @@ fn map_manual_override(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManualOverri
     })
 }
 
+fn map_release_artwork(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReleaseArtwork> {
+    Ok(ReleaseArtwork {
+        id: parse_uuid_id(row.get_ref(0)?, 0)?,
+        release_id: parse_uuid_id(row.get_ref(1)?, 1)?,
+        release_instance_id: row
+            .get_ref(2)?
+            .as_str()
+            .ok()
+            .map(ReleaseInstanceId::parse_str)
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(error))
+            })?,
+        source: parse_artwork_source(row.get(3)?),
+        is_primary: row.get(4)?,
+        original_path: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
+        managed_filename: row.get(6)?,
+        mime_type: row.get(7)?,
+    })
+}
+
 fn parse_manual_override_subject(
     kind: String,
     id: String,
@@ -3463,6 +3575,22 @@ fn manual_override_field_to_sql(field: &OverrideField) -> &'static str {
         OverrideField::ReleaseDate => "release_date",
         OverrideField::EditionQualifier => "edition_qualifier",
         OverrideField::ArtworkSelection => "artwork_selection",
+    }
+}
+
+fn parse_artwork_source(value: String) -> ArtworkSource {
+    match value.as_str() {
+        "operator_selected" => ArtworkSource::OperatorSelected,
+        "provider" => ArtworkSource::Provider,
+        _ => ArtworkSource::SourceLocal,
+    }
+}
+
+fn artwork_source_to_sql(value: &ArtworkSource) -> &'static str {
+    match value {
+        ArtworkSource::OperatorSelected => "operator_selected",
+        ArtworkSource::SourceLocal => "source_local",
+        ArtworkSource::Provider => "provider",
     }
 }
 

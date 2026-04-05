@@ -9,6 +9,7 @@ use crate::domain::job::{Job, JobStatus, JobType};
 use crate::domain::manual_override::{ManualOverride, OverrideField, OverrideSubject};
 use crate::domain::metadata_snapshot::MetadataSnapshot;
 use crate::domain::release::Release;
+use crate::domain::release_artwork::ReleaseArtwork;
 use crate::domain::release_group::ReleaseGroup;
 use crate::domain::release_instance::{FormatFamily, ReleaseInstance, ReleaseInstanceState};
 use crate::domain::source::{Source, SourceLocator};
@@ -17,7 +18,7 @@ use crate::domain::track::Track;
 use crate::domain::track_instance::TrackInstance;
 use crate::support::ids::{
     CandidateMatchId, ExportedMetadataSnapshotId, ImportBatchId, IssueId, JobId, ManualOverrideId,
-    ReleaseGroupId, ReleaseId, ReleaseInstanceId,
+    ReleaseArtworkId, ReleaseGroupId, ReleaseId, ReleaseInstanceId,
 };
 use crate::support::pagination::{Page, PageRequest};
 
@@ -301,6 +302,26 @@ pub trait ExportCommandRepository {
     fn update_exported_metadata_snapshot(
         &self,
         snapshot: &ExportedMetadataSnapshot,
+    ) -> Result<(), RepositoryError>;
+}
+
+pub trait ReleaseArtworkRepository {
+    fn get_release_artwork(
+        &self,
+        id: &ReleaseArtworkId,
+    ) -> Result<Option<ReleaseArtwork>, RepositoryError>;
+
+    fn list_release_artwork_for_release_instance(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+    ) -> Result<Vec<ReleaseArtwork>, RepositoryError>;
+}
+
+pub trait ReleaseArtworkCommandRepository {
+    fn replace_release_artwork_for_release_instance(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        artwork: &[ReleaseArtwork],
     ) -> Result<(), RepositoryError>;
 }
 

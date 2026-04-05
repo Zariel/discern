@@ -1,3 +1,4 @@
+use crate::application::artwork::{ArtworkExportError, ArtworkService};
 use crate::application::compatibility::{
     CompatibilityVerificationError, CompatibilityVerificationService,
 };
@@ -18,10 +19,10 @@ use crate::application::repository::{
     IngestEvidenceCommandRepository, IngestEvidenceRepository, IssueCommandRepository,
     IssueListQuery, IssueRepository, JobCommandRepository, JobListQuery, JobRepository,
     ManualOverrideCommandRepository, ManualOverrideRepository, MetadataSnapshotCommandRepository,
-    MetadataSnapshotRepository, ReleaseCommandRepository, ReleaseInstanceCommandRepository,
-    ReleaseInstanceRepository, ReleaseRepository, RepositoryError, RepositoryErrorKind,
-    SourceCommandRepository, SourceRepository, StagingManifestCommandRepository,
-    StagingManifestRepository,
+    MetadataSnapshotRepository, ReleaseArtworkCommandRepository, ReleaseArtworkRepository,
+    ReleaseCommandRepository, ReleaseInstanceCommandRepository, ReleaseInstanceRepository,
+    ReleaseRepository, RepositoryError, RepositoryErrorKind, SourceCommandRepository,
+    SourceRepository, StagingManifestCommandRepository, StagingManifestRepository,
 };
 use crate::application::tagging::{TagWriterService, TaggingError, TaggingErrorKind};
 use crate::application::workers::{WorkerPoolKind, WorkerPools};
@@ -91,6 +92,8 @@ where
         + ManualOverrideRepository
         + MetadataSnapshotCommandRepository
         + MetadataSnapshotRepository
+        + ReleaseArtworkCommandRepository
+        + ReleaseArtworkRepository
         + ReleaseCommandRepository
         + ReleaseInstanceCommandRepository
         + ReleaseInstanceRepository
@@ -358,6 +361,14 @@ where
             )
             .await
             .map_err(map_organization_error)?;
+        ArtworkService::new(self.repository.clone())
+            .export_primary_artwork(
+                &self.config.storage,
+                &self.config.export,
+                &release_instance_id,
+                changed_at_unix_seconds,
+            )
+            .map_err(map_artwork_error)?;
         let queued = self.enqueue_job_once(
             JobType::VerifyImport,
             JobSubject::ReleaseInstance(release_instance_id),
@@ -601,6 +612,13 @@ impl StageFailure {
     fn conflict(message: String) -> Self {
         Self {
             kind: StageFailureKind::Conflict,
+            message,
+        }
+    }
+
+    fn storage(message: String) -> Self {
+        Self {
+            kind: StageFailureKind::Storage,
             message,
         }
     }
@@ -886,6 +904,20 @@ fn map_organization_error(error: OrganizationError) -> StageFailure {
     }
 }
 
+fn map_artwork_error(error: ArtworkExportError) -> StageFailure {
+    match error.kind {
+        crate::application::artwork::ArtworkExportErrorKind::NotFound => {
+            StageFailure::not_found(error.message)
+        }
+        crate::application::artwork::ArtworkExportErrorKind::Conflict => {
+            StageFailure::conflict(error.message)
+        }
+        crate::application::artwork::ArtworkExportErrorKind::Storage => {
+            StageFailure::storage(error.message)
+        }
+    }
+}
+
 fn map_compatibility_error(error: CompatibilityVerificationError) -> StageFailure {
     StageFailure {
         kind: match error.kind {
@@ -1008,6 +1040,7 @@ mod tests {
     use crate::domain::manual_override::ManualOverride;
     use crate::domain::metadata_snapshot::{MetadataSnapshot, MetadataSubject};
     use crate::domain::release::{PartialDate, Release, ReleaseEdition};
+    use crate::domain::release_artwork::ReleaseArtwork;
     use crate::domain::release_group::{ReleaseGroup, ReleaseGroupKind};
     use crate::domain::release_instance::{
         BitrateMode, FormatFamily, IngestOrigin, ProvenanceSnapshot, ReleaseInstance,
@@ -1015,8 +1048,8 @@ mod tests {
     };
     use crate::domain::source::{Source, SourceKind, SourceLocator};
     use crate::domain::staging_manifest::{
-        GroupingDecision, GroupingStrategy, StagedReleaseGroup, StagingManifest,
-        StagingManifestSource,
+        AuxiliaryFile, AuxiliaryFileRole, GroupingDecision, GroupingStrategy, StagedReleaseGroup,
+        StagingManifest, StagingManifestSource,
     };
     use crate::domain::track::{Track, TrackPosition};
     use crate::domain::track_instance::TrackInstance;
@@ -1151,15 +1184,14 @@ mod tests {
             .managed_files(repository.release_instance_id())
             .pop()
             .expect("managed file should exist");
-        fs::write(
+        assert!(
             managed_file
                 .path
                 .parent()
                 .expect("managed parent should exist")
-                .join("cover.jpg"),
-            b"jpeg-data",
-        )
-        .expect("artwork should write");
+                .join("cover.jpg")
+                .is_file()
+        );
 
         let verified = service
             .run_job(&organized.queued_jobs[0].id, 50)
@@ -1487,6 +1519,7 @@ mod tests {
         candidate_matches: Arc<Mutex<HashMap<ReleaseInstanceId, Vec<CandidateMatch>>>>,
         manual_overrides: Arc<Mutex<Vec<ManualOverride>>>,
         exports: Arc<Mutex<Vec<ExportedMetadataSnapshot>>>,
+        artworks: Arc<Mutex<Vec<ReleaseArtwork>>>,
         track_instances: Arc<Mutex<Vec<TrackInstance>>>,
         files: Arc<Mutex<Vec<FileRecord>>>,
         issues: Arc<Mutex<Vec<Issue>>>,
@@ -1576,6 +1609,7 @@ mod tests {
                 candidate_matches: Arc::new(Mutex::new(HashMap::new())),
                 manual_overrides: Arc::new(Mutex::new(Vec::new())),
                 exports: Arc::new(Mutex::new(Vec::new())),
+                artworks: Arc::new(Mutex::new(Vec::new())),
                 track_instances: Arc::new(Mutex::new(Vec::new())),
                 files: Arc::new(Mutex::new(Vec::new())),
                 issues: Arc::new(Mutex::new(Vec::new())),
@@ -1671,6 +1705,8 @@ mod tests {
                         gazelle_reference: None,
                     },
                 });
+            let artwork_path = source_path.parent().expect("parent").join("folder.jpg");
+            fs::write(&artwork_path, b"jpeg-data").expect("artwork should write");
             self.manifests
                 .lock()
                 .expect("manifests should lock")
@@ -1682,13 +1718,16 @@ mod tests {
                         source_path: source_path.parent().expect("parent").to_path_buf(),
                     },
                     discovered_files: Vec::new(),
-                    auxiliary_files: Vec::new(),
+                    auxiliary_files: vec![AuxiliaryFile {
+                        path: artwork_path.clone(),
+                        role: AuxiliaryFileRole::Artwork,
+                    }],
                     grouping: GroupingDecision {
                         strategy: GroupingStrategy::CommonParentDirectory,
                         groups: vec![StagedReleaseGroup {
                             key: "kid-a".to_string(),
                             file_paths: vec![source_path],
-                            auxiliary_paths: Vec::new(),
+                            auxiliary_paths: vec![artwork_path],
                         }],
                         notes: Vec::new(),
                     },
@@ -2525,6 +2564,48 @@ mod tests {
                     message: "snapshot not found".to_string(),
                 })?;
             *stored = snapshot.clone();
+            Ok(())
+        }
+    }
+    impl crate::application::repository::ReleaseArtworkRepository for InMemoryPipelineRepository {
+        fn get_release_artwork(
+            &self,
+            id: &crate::support::ids::ReleaseArtworkId,
+        ) -> Result<Option<ReleaseArtwork>, RepositoryError> {
+            Ok(self
+                .artworks
+                .lock()
+                .expect("artworks should lock")
+                .iter()
+                .find(|item| item.id == *id)
+                .cloned())
+        }
+
+        fn list_release_artwork_for_release_instance(
+            &self,
+            release_instance_id: &ReleaseInstanceId,
+        ) -> Result<Vec<ReleaseArtwork>, RepositoryError> {
+            Ok(self
+                .artworks
+                .lock()
+                .expect("artworks should lock")
+                .iter()
+                .filter(|item| item.release_instance_id.as_ref() == Some(release_instance_id))
+                .cloned()
+                .collect())
+        }
+    }
+    impl crate::application::repository::ReleaseArtworkCommandRepository
+        for InMemoryPipelineRepository
+    {
+        fn replace_release_artwork_for_release_instance(
+            &self,
+            release_instance_id: &ReleaseInstanceId,
+            artwork: &[ReleaseArtwork],
+        ) -> Result<(), RepositoryError> {
+            let mut items = self.artworks.lock().expect("artworks should lock");
+            items.retain(|item| item.release_instance_id.as_ref() != Some(release_instance_id));
+            items.extend_from_slice(artwork);
             Ok(())
         }
     }

@@ -1,3 +1,4 @@
+pub mod artwork;
 pub mod compatibility;
 pub mod config;
 pub mod duplicates;
