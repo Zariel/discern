@@ -4,7 +4,7 @@ use crate::config::{AppConfig, ConfigValidationReport};
 use crate::infrastructure::Infrastructure;
 use crate::web::WebSurface;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Runtime {
     pub config: AppConfig,
     pub application: ApplicationContext,
@@ -38,7 +38,7 @@ pub fn bootstrap(config: AppConfig) -> Result<Runtime, RuntimeBootstrapError> {
     let infrastructure = Infrastructure::from_config(&config.storage);
 
     Ok(Runtime {
-        application: ApplicationContext::new(),
+        application: ApplicationContext::new(&config.workers),
         api: ApiSurface::from_config(&config.api),
         web: WebSurface::from_config(&config.web),
         infrastructure,
@@ -58,6 +58,9 @@ mod tests {
 
         assert_eq!(runtime.api.base_path, "/api");
         assert_eq!(runtime.web.mount_path, "/");
+        assert_eq!(runtime.application.workers.file_io.limit(), 2);
+        assert_eq!(runtime.application.workers.provider_requests.limit(), 2);
+        assert_eq!(runtime.application.workers.db_writes.limit(), 1);
         assert_eq!(
             runtime.infrastructure.sqlite.database_path,
             std::path::PathBuf::from("discern.db")
@@ -69,16 +72,15 @@ mod tests {
         let mut config = AppConfig::default();
         config.api.base_path = "api".to_string();
 
-        assert_eq!(
+        assert!(matches!(
             bootstrap(config),
-            Err(RuntimeBootstrapError::InvalidConfig(
-                ConfigValidationReport {
-                    errors: vec![ConfigValidationIssue {
-                        field: "api.base_path".to_string(),
-                        message: "path must start with '/'".to_string(),
-                    }],
-                }
-            ))
-        );
+            Err(RuntimeBootstrapError::InvalidConfig(ConfigValidationReport {
+                errors
+            })) if errors
+                == vec![ConfigValidationIssue {
+                    field: "api.base_path".to_string(),
+                    message: "path must start with '/'".to_string(),
+                }]
+        ));
     }
 }

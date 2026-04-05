@@ -50,6 +50,27 @@ impl AppConfig {
             ));
         }
 
+        if self.workers.file_io_concurrency == 0 {
+            return Err(ConfigError::new(
+                "workers.file_io_concurrency",
+                "file I/O worker concurrency must be greater than zero",
+            ));
+        }
+
+        if self.workers.provider_request_concurrency == 0 {
+            return Err(ConfigError::new(
+                "workers.provider_request_concurrency",
+                "provider request concurrency must be greater than zero",
+            ));
+        }
+
+        if self.workers.db_write_concurrency == 0 {
+            return Err(ConfigError::new(
+                "workers.db_write_concurrency",
+                "DB write concurrency must be greater than zero",
+            ));
+        }
+
         if self.export.profiles.is_empty() {
             return Err(ConfigError::new(
                 "export.profiles",
@@ -108,6 +129,7 @@ impl AppConfig {
 
         validate_watch_directories(self, &mut report);
         validate_provider_credentials(self, &mut report);
+        validate_worker_topology(self, &mut report);
         validate_distinguishability_rules(
             self,
             &release_placeholders,
@@ -355,12 +377,18 @@ impl Default for DiscogsConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerConfig {
     pub max_concurrent_jobs: usize,
+    pub file_io_concurrency: usize,
+    pub provider_request_concurrency: usize,
+    pub db_write_concurrency: usize,
 }
 
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             max_concurrent_jobs: 2,
+            file_io_concurrency: 2,
+            provider_request_concurrency: 2,
+            db_write_concurrency: 1,
         }
     }
 }
@@ -603,6 +631,15 @@ fn validate_provider_credentials(config: &AppConfig, report: &mut ConfigValidati
     }
 }
 
+fn validate_worker_topology(config: &AppConfig, report: &mut ConfigValidationReport) {
+    if config.workers.db_write_concurrency != 1 {
+        report.push(
+            "workers.db_write_concurrency",
+            "SQLite runtime requires a single DB write worker",
+        );
+    }
+}
+
 fn validate_distinguishability_rules(
     config: &AppConfig,
     release_placeholders: &[String],
@@ -776,6 +813,48 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_file_io_worker_concurrency() {
+        let mut config = AppConfig::default();
+        config.workers.file_io_concurrency = 0;
+
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::new(
+                "workers.file_io_concurrency",
+                "file I/O worker concurrency must be greater than zero",
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_zero_provider_request_concurrency() {
+        let mut config = AppConfig::default();
+        config.workers.provider_request_concurrency = 0;
+
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::new(
+                "workers.provider_request_concurrency",
+                "provider request concurrency must be greater than zero",
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_zero_db_write_concurrency() {
+        let mut config = AppConfig::default();
+        config.workers.db_write_concurrency = 0;
+
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::new(
+                "workers.db_write_concurrency",
+                "DB write concurrency must be greater than zero",
+            ))
+        );
+    }
+
+    #[test]
     fn startup_validation_rejects_overlapping_watch_directories() {
         let mut config = AppConfig::default();
         config.storage.watch_directories[0].path = PathBuf::from("/music/incoming");
@@ -874,6 +953,22 @@ mod tests {
                 errors: vec![ConfigValidationIssue {
                     field: "providers.discogs.personal_access_token".to_string(),
                     message: "discogs requires a personal access token when enabled".to_string(),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn startup_validation_rejects_multiple_db_write_workers() {
+        let mut config = AppConfig::default();
+        config.workers.db_write_concurrency = 2;
+
+        assert_eq!(
+            config.validate_startup(),
+            Err(ConfigValidationReport {
+                errors: vec![ConfigValidationIssue {
+                    field: "workers.db_write_concurrency".to_string(),
+                    message: "SQLite runtime requires a single DB write worker".to_string(),
                 }],
             })
         );
