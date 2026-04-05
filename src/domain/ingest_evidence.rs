@@ -45,6 +45,8 @@ pub enum ObservedValueKind {
     DiscNumber,
     DurationMs,
     FormatFamily,
+    Label,
+    CatalogNumber,
     MediaDescriptor,
     SourceDescriptor,
     TrackerIdentifier,

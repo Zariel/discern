@@ -95,6 +95,13 @@ pub trait ReleaseInstanceCommandRepository {
         release_instance_id: &ReleaseInstanceId,
         matches: &[CandidateMatch],
     ) -> Result<(), RepositoryError>;
+
+    fn replace_candidate_matches_for_provider(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        provider: &crate::domain::candidate_match::CandidateProvider,
+        matches: &[CandidateMatch],
+    ) -> Result<(), RepositoryError>;
 }
 
 pub trait ImportBatchRepository {
@@ -162,6 +169,11 @@ pub trait MetadataSnapshotRepository {
     fn list_metadata_snapshots_for_batch(
         &self,
         batch_id: &ImportBatchId,
+    ) -> Result<Vec<MetadataSnapshot>, RepositoryError>;
+
+    fn list_metadata_snapshots_for_release_instance(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
     ) -> Result<Vec<MetadataSnapshot>, RepositoryError>;
 }
 

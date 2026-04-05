@@ -601,6 +601,57 @@ impl ReleaseInstanceCommandRepository for SqliteRepositories {
             Ok(())
         })
     }
+
+    fn replace_candidate_matches_for_provider(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        provider: &CandidateProvider,
+        matches: &[CandidateMatch],
+    ) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "DELETE FROM candidate_matches
+                     WHERE release_instance_id = ?1
+                       AND provider = ?2",
+                    params![
+                        release_instance_id.as_uuid().to_string(),
+                        candidate_provider_to_sql(provider),
+                    ],
+                )
+                .map_err(to_storage_error)?;
+            for candidate_match in matches {
+                transaction
+                    .execute(
+                        "INSERT INTO candidate_matches
+                         (id, release_instance_id, provider, candidate_kind, provider_entity_id,
+                          normalized_score, evidence_matches_json, mismatches_json,
+                          unresolved_ambiguities_json, provider_provenance_json,
+                          created_at_unix_seconds)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        params![
+                            candidate_match.id.as_uuid().to_string(),
+                            candidate_match.release_instance_id.as_uuid().to_string(),
+                            candidate_provider_to_sql(&candidate_match.provider),
+                            candidate_subject_kind_to_sql(&candidate_match.subject),
+                            candidate_subject_id(&candidate_match.subject),
+                            f64::from(candidate_match.normalized_score.value()),
+                            serialize_evidence_notes(&candidate_match.evidence_matches)
+                                .map_err(storage_error)?,
+                            serialize_evidence_notes(&candidate_match.mismatches)
+                                .map_err(storage_error)?,
+                            serde_json::to_string(&candidate_match.unresolved_ambiguities)
+                                .map_err(|error| storage_error(error.to_string()))?,
+                            serialize_provider_provenance(&candidate_match.provider_provenance)
+                                .map_err(storage_error)?,
+                            candidate_match.provider_provenance.fetched_at_unix_seconds,
+                        ],
+                    )
+                    .map_err(to_storage_error)?;
+            }
+            Ok(())
+        })
+    }
 }
 
 impl ImportBatchRepository for SqliteRepositories {
@@ -968,6 +1019,31 @@ impl MetadataSnapshotRepository for SqliteRepositories {
         statement
             .query_map(
                 params![batch_id.as_uuid().to_string()],
+                map_metadata_snapshot,
+            )
+            .map_err(to_storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_storage_error)
+    }
+
+    fn list_metadata_snapshots_for_release_instance(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+    ) -> Result<Vec<MetadataSnapshot>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, subject_kind, subject_id, source, format, payload,
+                        captured_at_unix_seconds
+                 FROM metadata_snapshots
+                 WHERE subject_kind = 'release_instance'
+                   AND subject_id = ?1
+                 ORDER BY captured_at_unix_seconds DESC",
+            )
+            .map_err(to_storage_error)?;
+        statement
+            .query_map(
+                params![release_instance_id.as_uuid().to_string()],
                 map_metadata_snapshot,
             )
             .map_err(to_storage_error)?
@@ -2473,6 +2549,8 @@ fn observed_value_kind_to_sql(value: &ObservedValueKind) -> &'static str {
         ObservedValueKind::DiscNumber => "disc_number",
         ObservedValueKind::DurationMs => "duration_ms",
         ObservedValueKind::FormatFamily => "format_family",
+        ObservedValueKind::Label => "label",
+        ObservedValueKind::CatalogNumber => "catalog_number",
         ObservedValueKind::MediaDescriptor => "media_descriptor",
         ObservedValueKind::SourceDescriptor => "source_descriptor",
         ObservedValueKind::TrackerIdentifier => "tracker_identifier",

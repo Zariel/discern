@@ -3,9 +3,9 @@ use std::future::Future;
 use std::path::PathBuf;
 
 use crate::application::repository::{
-    ImportBatchRepository, IngestEvidenceRepository, ReleaseInstanceCommandRepository,
-    ReleaseInstanceRepository, RepositoryError, RepositoryErrorKind, SourceRepository,
-    StagingManifestRepository,
+    ImportBatchRepository, IngestEvidenceRepository, MetadataSnapshotCommandRepository,
+    ReleaseInstanceCommandRepository, ReleaseInstanceRepository, RepositoryError,
+    RepositoryErrorKind, SourceRepository, StagingManifestRepository,
 };
 use crate::domain::candidate_match::{
     CandidateMatch, CandidateProvider, CandidateScore, CandidateSubject, EvidenceKind,
@@ -14,6 +14,9 @@ use crate::domain::candidate_match::{
 use crate::domain::import_batch::ImportBatch;
 use crate::domain::ingest_evidence::{
     IngestEvidenceRecord, IngestEvidenceSubject, ObservedValueKind,
+};
+use crate::domain::metadata_snapshot::{
+    MetadataSnapshot, MetadataSnapshotSource, MetadataSubject, SnapshotFormat,
 };
 use crate::domain::release_instance::{
     BitrateMode, FormatFamily, IngestOrigin, ProvenanceSnapshot, ReleaseInstance,
@@ -59,6 +62,8 @@ pub struct MatchEvidenceSummary {
     pub primary_artist: Option<String>,
     pub release_title: Option<String>,
     pub release_year: Option<String>,
+    pub label_hints: Vec<String>,
+    pub catalog_hints: Vec<String>,
     pub track_count: usize,
     pub disc_count: Option<usize>,
     pub directory_hint: Option<String>,
@@ -107,6 +112,46 @@ pub struct MusicBrainzReleaseGroupCandidate {
     pub first_release_date: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiscogsReleaseQuery {
+    pub text: Option<String>,
+    pub artist: Option<String>,
+    pub title: Option<String>,
+    pub year: Option<String>,
+    pub label: Option<String>,
+    pub catalog_number: Option<String>,
+    pub format_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscogsReleaseCandidate {
+    pub id: String,
+    pub title: String,
+    pub artist: Option<String>,
+    pub year: Option<String>,
+    pub country: Option<String>,
+    pub label: Option<String>,
+    pub catalog_number: Option<String>,
+    pub format_descriptors: Vec<String>,
+    pub raw_payload: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscogsFieldDifference {
+    pub field: String,
+    pub local_value: Option<String>,
+    pub provider_value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscogsEnrichmentReport {
+    pub release_instance: ReleaseInstance,
+    pub query: DiscogsReleaseQuery,
+    pub persisted_candidates: Vec<CandidateMatch>,
+    pub metadata_snapshot: MetadataSnapshot,
+    pub field_differences: Vec<DiscogsFieldDifference>,
+}
+
 pub trait MusicBrainzMetadataProvider {
     fn search_releases(
         &self,
@@ -119,6 +164,14 @@ pub trait MusicBrainzMetadataProvider {
         query: &str,
         limit: u8,
     ) -> impl Future<Output = Result<Vec<MusicBrainzReleaseGroupCandidate>, String>> + Send;
+}
+
+pub trait DiscogsMetadataProvider {
+    fn search_releases(
+        &self,
+        query: &DiscogsReleaseQuery,
+        limit: u8,
+    ) -> impl Future<Output = Result<Vec<DiscogsReleaseCandidate>, String>> + Send;
 }
 
 pub struct ReleaseMatchingService<R, P> {
@@ -162,11 +215,10 @@ where
             let summary = summarize_group_evidence(group, &evidence_by_path, &evidence_by_group);
             let release_query = build_release_query(&summary);
             let release_group_query = build_release_group_query(&summary);
-            let release_candidates = self
-                .provider
-                .search_releases(&release_query, 10)
-                .await
-                .map_err(map_provider_error)?;
+            let release_candidates =
+                MusicBrainzMetadataProvider::search_releases(&self.provider, &release_query, 10)
+                    .await
+                    .map_err(map_provider_error)?;
             let release_group_candidates = self
                 .provider
                 .search_release_groups(&release_group_query, 10)
@@ -194,11 +246,12 @@ impl<R, P> ReleaseMatchingService<R, P>
 where
     R: ImportBatchRepository
         + IngestEvidenceRepository
+        + MetadataSnapshotCommandRepository
         + ReleaseInstanceCommandRepository
         + ReleaseInstanceRepository
         + SourceRepository
         + StagingManifestRepository,
-    P: MusicBrainzMetadataProvider,
+    P: MusicBrainzMetadataProvider + DiscogsMetadataProvider,
 {
     pub async fn score_and_persist_batch_matches(
         &self,
@@ -243,11 +296,10 @@ where
             let summary = summarize_group_evidence(group, &evidence_by_path, &evidence_by_group);
             let release_query = build_release_query(&summary);
             let release_group_query = build_release_group_query(&summary);
-            let release_candidates = self
-                .provider
-                .search_releases(&release_query, 10)
-                .await
-                .map_err(map_provider_error)?;
+            let release_candidates =
+                MusicBrainzMetadataProvider::search_releases(&self.provider, &release_query, 10)
+                    .await
+                    .map_err(map_provider_error)?;
             let release_group_candidates = self
                 .provider
                 .search_release_groups(&release_group_query, 10)
@@ -298,6 +350,102 @@ where
         Ok(PersistedBatchMatchReport {
             batch_id: batch_id.clone(),
             groups,
+        })
+    }
+
+    pub async fn enrich_release_instance_with_discogs(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        persisted_at_unix_seconds: i64,
+    ) -> Result<DiscogsEnrichmentReport, MatchingServiceError> {
+        let release_instance = self
+            .repository
+            .get_release_instance(release_instance_id)
+            .map_err(map_repository_error)?
+            .ok_or_else(|| MatchingServiceError {
+                kind: MatchingServiceErrorKind::NotFound,
+                message: format!(
+                    "no release instance found for {}",
+                    release_instance_id.as_uuid()
+                ),
+            })?;
+        let manifest = latest_manifest(
+            self.repository
+                .list_staging_manifests_for_batch(&release_instance.import_batch_id)
+                .map_err(map_repository_error)?,
+            &release_instance.import_batch_id,
+        )?;
+        let evidence = self
+            .repository
+            .list_ingest_evidence_for_batch(&release_instance.import_batch_id)
+            .map_err(map_repository_error)?;
+        let evidence_by_path = evidence_by_discovered_path(&evidence);
+        let evidence_by_group = evidence_by_group_key(&evidence);
+        let group = manifest
+            .grouping
+            .groups
+            .iter()
+            .find(|group| {
+                representative_group_path(group) == release_instance.provenance.original_source_path
+            })
+            .ok_or_else(|| MatchingServiceError {
+                kind: MatchingServiceErrorKind::NotFound,
+                message: format!(
+                    "no staged group found for release instance {}",
+                    release_instance_id.as_uuid()
+                ),
+            })?;
+        let summary = summarize_group_evidence(group, &evidence_by_path, &evidence_by_group);
+        let query = build_discogs_query(&summary);
+        let results = DiscogsMetadataProvider::search_releases(&self.provider, &query, 10)
+            .await
+            .map_err(map_provider_error)?;
+        let persisted_candidates = score_discogs_candidates(
+            release_instance_id,
+            &summary,
+            &query,
+            results.clone(),
+            persisted_at_unix_seconds,
+        );
+        self.repository
+            .replace_candidate_matches_for_provider(
+                release_instance_id,
+                &CandidateProvider::Discogs,
+                &persisted_candidates,
+            )
+            .map_err(map_repository_error)?;
+        let metadata_snapshot = MetadataSnapshot {
+            id: crate::support::ids::MetadataSnapshotId::new(),
+            subject: MetadataSubject::ReleaseInstance(release_instance_id.clone()),
+            source: MetadataSnapshotSource::DiscogsPayload,
+            format: SnapshotFormat::Json,
+            payload: serde_json::to_string(
+                &results
+                    .iter()
+                    .map(|item| item.raw_payload.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|error| MatchingServiceError {
+                kind: MatchingServiceErrorKind::Storage,
+                message: format!("failed to serialize Discogs payloads: {error}"),
+            })?,
+            captured_at_unix_seconds: persisted_at_unix_seconds,
+        };
+        self.repository
+            .create_metadata_snapshots(std::slice::from_ref(&metadata_snapshot))
+            .map_err(map_repository_error)?;
+
+        let field_differences = results
+            .first()
+            .map(|candidate| discogs_field_differences(&summary, candidate))
+            .unwrap_or_default();
+
+        Ok(DiscogsEnrichmentReport {
+            release_instance,
+            query,
+            persisted_candidates,
+            metadata_snapshot,
+            field_differences,
         })
     }
 }
@@ -378,6 +526,8 @@ fn summarize_group_evidence(
     let mut yaml_artists = Vec::new();
     let mut yaml_titles = Vec::new();
     let mut yaml_years = Vec::new();
+    let mut label_hints = BTreeSet::new();
+    let mut catalog_hints = BTreeSet::new();
     let mut source_descriptors = BTreeSet::new();
     let mut tracker_identifiers = BTreeSet::new();
     if let Some(records) = evidence_by_group.get(&group.key) {
@@ -387,6 +537,12 @@ fn summarize_group_evidence(
                     ObservedValueKind::Artist => yaml_artists.push(observation.value.clone()),
                     ObservedValueKind::ReleaseTitle => yaml_titles.push(observation.value.clone()),
                     ObservedValueKind::ReleaseYear => yaml_years.push(observation.value.clone()),
+                    ObservedValueKind::Label => {
+                        label_hints.insert(observation.value.clone());
+                    }
+                    ObservedValueKind::CatalogNumber => {
+                        catalog_hints.insert(observation.value.clone());
+                    }
                     ObservedValueKind::SourceDescriptor | ObservedValueKind::MediaDescriptor => {
                         source_descriptors.insert(observation.value.clone());
                     }
@@ -426,6 +582,8 @@ fn summarize_group_evidence(
         primary_artist,
         release_title,
         release_year,
+        label_hints: label_hints.into_iter().collect(),
+        catalog_hints: catalog_hints.into_iter().collect(),
         track_count: group.file_paths.len(),
         disc_count: if disc_numbers.is_empty() {
             None
@@ -1034,6 +1192,197 @@ fn needs_review(candidates: &[CandidateMatch]) -> bool {
         .any(|candidate| best.normalized_score.value() - candidate.normalized_score.value() <= 0.05)
 }
 
+fn build_discogs_query(summary: &MatchEvidenceSummary) -> DiscogsReleaseQuery {
+    DiscogsReleaseQuery {
+        text: summary
+            .release_title
+            .clone()
+            .or_else(|| summary.directory_hint.clone()),
+        artist: summary.primary_artist.clone(),
+        title: summary.release_title.clone(),
+        year: summary.release_year.clone(),
+        label: summary.label_hints.first().cloned(),
+        catalog_number: summary.catalog_hints.first().cloned(),
+        format_hint: summary.source_descriptors.first().cloned(),
+    }
+}
+
+fn score_discogs_candidates(
+    release_instance_id: &ReleaseInstanceId,
+    summary: &MatchEvidenceSummary,
+    query: &DiscogsReleaseQuery,
+    candidates: Vec<DiscogsReleaseCandidate>,
+    persisted_at_unix_seconds: i64,
+) -> Vec<CandidateMatch> {
+    let mut matches = candidates
+        .into_iter()
+        .map(|candidate| {
+            let mut evidence_matches = Vec::new();
+            let mut mismatches = Vec::new();
+            let mut score = 0.10;
+
+            compare_artist(
+                summary.primary_artist.as_deref(),
+                &candidate.artist.iter().cloned().collect::<Vec<_>>(),
+                &mut evidence_matches,
+                &mut mismatches,
+                &mut score,
+            );
+            compare_release_title(
+                summary.release_title.as_deref(),
+                Some(candidate.title.as_str()),
+                &mut evidence_matches,
+                &mut mismatches,
+                &mut score,
+            );
+            compare_release_year(
+                summary.release_year.as_deref(),
+                candidate.year.as_deref(),
+                &mut evidence_matches,
+                &mut mismatches,
+                &mut score,
+            );
+            compare_label_catalog(
+                &summary.label_hints,
+                &summary.catalog_hints,
+                candidate.label.as_deref(),
+                candidate.catalog_number.as_deref(),
+                &mut evidence_matches,
+                &mut mismatches,
+                &mut score,
+            );
+            compare_format_descriptors(
+                &summary.source_descriptors,
+                &candidate.format_descriptors,
+                &mut evidence_matches,
+                &mut score,
+            );
+
+            CandidateMatch {
+                id: CandidateMatchId::new(),
+                release_instance_id: release_instance_id.clone(),
+                provider: CandidateProvider::Discogs,
+                subject: CandidateSubject::Release {
+                    provider_id: candidate.id,
+                },
+                normalized_score: CandidateScore::new(score.clamp(0.0, 1.0)),
+                evidence_matches,
+                mismatches,
+                unresolved_ambiguities: Vec::new(),
+                provider_provenance: ProviderProvenance {
+                    provider_name: "discogs".to_string(),
+                    query: format!("{query:?}"),
+                    fetched_at_unix_seconds: persisted_at_unix_seconds,
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .normalized_score
+            .value()
+            .total_cmp(&left.normalized_score.value())
+    });
+    matches
+}
+
+fn compare_label_catalog(
+    expected_labels: &[String],
+    expected_catalogs: &[String],
+    provider_label: Option<&str>,
+    provider_catalog: Option<&str>,
+    matches: &mut Vec<EvidenceNote>,
+    mismatches: &mut Vec<EvidenceNote>,
+    score: &mut f32,
+) {
+    if provider_label
+        .map(|value| {
+            expected_labels
+                .iter()
+                .any(|item| normalize_text(item) == normalize_text(value))
+        })
+        .unwrap_or(false)
+    {
+        *score += 0.20;
+        matches.push(note(
+            EvidenceKind::LabelCatalogAlignment,
+            "label aligned with local evidence",
+        ));
+    } else if !expected_labels.is_empty() && provider_label.is_some() {
+        mismatches.push(note(
+            EvidenceKind::LabelCatalogAlignment,
+            "label differed from local evidence",
+        ));
+    }
+
+    if provider_catalog
+        .map(|value| {
+            expected_catalogs
+                .iter()
+                .any(|item| normalize_text(item) == normalize_text(value))
+        })
+        .unwrap_or(false)
+    {
+        *score += 0.25;
+        matches.push(note(
+            EvidenceKind::LabelCatalogAlignment,
+            "catalog number aligned with local evidence",
+        ));
+    } else if !expected_catalogs.is_empty() && provider_catalog.is_some() {
+        mismatches.push(note(
+            EvidenceKind::LabelCatalogAlignment,
+            "catalog number differed from local evidence",
+        ));
+    }
+}
+
+fn compare_format_descriptors(
+    expected_descriptors: &[String],
+    provider_descriptors: &[String],
+    matches: &mut Vec<EvidenceNote>,
+    score: &mut f32,
+) {
+    if expected_descriptors.iter().any(|expected| {
+        provider_descriptors
+            .iter()
+            .any(|provider| normalize_text(provider).contains(&normalize_text(expected)))
+    }) {
+        *score += 0.10;
+        matches.push(note(
+            EvidenceKind::GazelleConsistency,
+            "format or source descriptors aligned",
+        ));
+    }
+}
+
+fn discogs_field_differences(
+    summary: &MatchEvidenceSummary,
+    candidate: &DiscogsReleaseCandidate,
+) -> Vec<DiscogsFieldDifference> {
+    vec![
+        DiscogsFieldDifference {
+            field: "label".to_string(),
+            local_value: summary.label_hints.first().cloned(),
+            provider_value: candidate.label.clone(),
+        },
+        DiscogsFieldDifference {
+            field: "catalog_number".to_string(),
+            local_value: summary.catalog_hints.first().cloned(),
+            provider_value: candidate.catalog_number.clone(),
+        },
+        DiscogsFieldDifference {
+            field: "year".to_string(),
+            local_value: summary.release_year.clone(),
+            provider_value: candidate.year.clone(),
+        },
+        DiscogsFieldDifference {
+            field: "country".to_string(),
+            local_value: None,
+            provider_value: candidate.country.clone(),
+        },
+    ]
+}
+
 fn map_repository_error(error: RepositoryError) -> MatchingServiceError {
     MatchingServiceError {
         kind: match error.kind {
@@ -1061,8 +1410,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::application::repository::{
-        ImportBatchRepository, ReleaseInstanceCommandRepository, ReleaseInstanceRepository,
-        SourceRepository,
+        ImportBatchRepository, MetadataSnapshotCommandRepository, ReleaseInstanceCommandRepository,
+        ReleaseInstanceRepository, SourceRepository,
     };
     use crate::domain::candidate_match::CandidateMatch;
     use crate::domain::import_batch::{BatchRequester, ImportBatch, ImportBatchStatus, ImportMode};
@@ -1127,6 +1476,8 @@ mod tests {
             primary_artist: Some("Radiohead".to_string()),
             release_title: Some("Kid A".to_string()),
             release_year: Some("2000".to_string()),
+            label_hints: Vec::new(),
+            catalog_hints: Vec::new(),
             track_count: 10,
             disc_count: Some(1),
             directory_hint: Some("Kid A".to_string()),
@@ -1232,6 +1583,39 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn discogs_enrichment_persists_payloads_without_overriding_identity() {
+        let batch_id = ImportBatchId::new();
+        let repository = InMemoryMatchingRepository::with_batch(batch_id.clone());
+        let provider = FakeMusicBrainzProvider::default();
+        let service = ReleaseMatchingService::new(repository.clone(), provider);
+        let scored = service
+            .score_and_persist_batch_matches(&batch_id, 50)
+            .await
+            .expect("candidate scoring should succeed");
+
+        let report = service
+            .enrich_release_instance_with_discogs(&scored.groups[0].release_instance.id, 60)
+            .await
+            .expect("discogs enrichment should succeed");
+
+        assert_eq!(report.release_instance.release_id, None);
+        assert_eq!(
+            report.persisted_candidates[0].provider,
+            CandidateProvider::Discogs
+        );
+        assert_eq!(
+            report.metadata_snapshot.source,
+            MetadataSnapshotSource::DiscogsPayload
+        );
+        assert!(
+            repository
+                .stored_metadata_snapshots(&scored.groups[0].release_instance.id)
+                .iter()
+                .any(|snapshot| snapshot.source == MetadataSnapshotSource::DiscogsPayload)
+        );
+    }
+
     #[derive(Clone)]
     struct FakeMusicBrainzProvider {
         queries: Arc<Mutex<Vec<String>>>,
@@ -1306,6 +1690,27 @@ mod tests {
         }
     }
 
+    impl DiscogsMetadataProvider for FakeMusicBrainzProvider {
+        fn search_releases(
+            &self,
+            _query: &DiscogsReleaseQuery,
+            _limit: u8,
+        ) -> impl Future<Output = Result<Vec<DiscogsReleaseCandidate>, String>> + Send {
+            let items = vec![DiscogsReleaseCandidate {
+                id: "discogs-1".to_string(),
+                title: "Kid A".to_string(),
+                artist: Some("Radiohead".to_string()),
+                year: Some("2000".to_string()),
+                country: Some("UK".to_string()),
+                label: Some("XL Recordings".to_string()),
+                catalog_number: Some("XLLP782".to_string()),
+                format_descriptors: vec!["CD".to_string(), "Album".to_string()],
+                raw_payload: "{\"id\":1}".to_string(),
+            }];
+            async move { Ok(items) }
+        }
+    }
+
     #[derive(Clone)]
     struct InMemoryMatchingRepository {
         batch: Arc<ImportBatch>,
@@ -1314,6 +1719,7 @@ mod tests {
         evidence: Arc<Vec<IngestEvidenceRecord>>,
         release_instances: Arc<Mutex<Vec<ReleaseInstance>>>,
         candidate_matches: Arc<Mutex<HashMap<ReleaseInstanceId, Vec<CandidateMatch>>>>,
+        metadata_snapshots: Arc<Mutex<Vec<MetadataSnapshot>>>,
     }
 
     impl InMemoryMatchingRepository {
@@ -1388,6 +1794,7 @@ mod tests {
                 evidence: Arc::new(evidence),
                 release_instances: Arc::new(Mutex::new(Vec::new())),
                 candidate_matches: Arc::new(Mutex::new(HashMap::new())),
+                metadata_snapshots: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1400,6 +1807,24 @@ mod tests {
                 .expect("candidate matches should lock")
                 .get(release_instance_id)
                 .cloned()
+        }
+
+        fn stored_metadata_snapshots(
+            &self,
+            release_instance_id: &ReleaseInstanceId,
+        ) -> Vec<MetadataSnapshot> {
+            self.metadata_snapshots
+                .lock()
+                .expect("metadata snapshots should lock")
+                .iter()
+                .filter(|snapshot| {
+                    matches!(
+                        snapshot.subject,
+                        MetadataSubject::ReleaseInstance(ref id) if id == release_instance_id
+                    )
+                })
+                .cloned()
+                .collect()
         }
     }
 
@@ -1548,6 +1973,41 @@ mod tests {
                 .lock()
                 .expect("candidate matches should lock")
                 .insert(release_instance_id.clone(), matches.to_vec());
+            Ok(())
+        }
+
+        fn replace_candidate_matches_for_provider(
+            &self,
+            release_instance_id: &ReleaseInstanceId,
+            provider: &CandidateProvider,
+            matches: &[CandidateMatch],
+        ) -> Result<(), RepositoryError> {
+            let mut all_matches = self
+                .candidate_matches
+                .lock()
+                .expect("candidate matches should lock");
+            let existing = all_matches.entry(release_instance_id.clone()).or_default();
+            existing.retain(|candidate| &candidate.provider != provider);
+            existing.extend_from_slice(matches);
+            existing.sort_by(|left, right| {
+                right
+                    .normalized_score
+                    .value()
+                    .total_cmp(&left.normalized_score.value())
+            });
+            Ok(())
+        }
+    }
+
+    impl MetadataSnapshotCommandRepository for InMemoryMatchingRepository {
+        fn create_metadata_snapshots(
+            &self,
+            snapshots: &[MetadataSnapshot],
+        ) -> Result<(), RepositoryError> {
+            self.metadata_snapshots
+                .lock()
+                .expect("metadata snapshots should lock")
+                .extend_from_slice(snapshots);
             Ok(())
         }
     }

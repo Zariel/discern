@@ -493,6 +493,8 @@ fn observed_value_kind_key(kind: &ObservedValueKind) -> &'static str {
         ObservedValueKind::DiscNumber => "disc_number",
         ObservedValueKind::DurationMs => "duration_ms",
         ObservedValueKind::FormatFamily => "format_family",
+        ObservedValueKind::Label => "label",
+        ObservedValueKind::CatalogNumber => "catalog_number",
         ObservedValueKind::MediaDescriptor => "media_descriptor",
         ObservedValueKind::SourceDescriptor => "source_descriptor",
         ObservedValueKind::TrackerIdentifier => "tracker_identifier",
@@ -873,6 +875,9 @@ fn parse_gazelle_yaml_evidence(
         ("release_name", ObservedValueKind::ReleaseTitle),
         ("artist", ObservedValueKind::Artist),
         ("year", ObservedValueKind::ReleaseYear),
+        ("label", ObservedValueKind::Label),
+        ("catalog_number", ObservedValueKind::CatalogNumber),
+        ("catalog", ObservedValueKind::CatalogNumber),
         ("media", ObservedValueKind::MediaDescriptor),
         ("source", ObservedValueKind::SourceDescriptor),
         ("format", ObservedValueKind::FormatFamily),
@@ -950,6 +955,8 @@ fn observations_from_vorbis_comments(
             "tracknumber" => Some(ObservedValueKind::TrackNumber),
             "discnumber" => Some(ObservedValueKind::DiscNumber),
             "date" | "year" => Some(ObservedValueKind::ReleaseYear),
+            "label" | "organization" | "publisher" => Some(ObservedValueKind::Label),
+            "catalog_number" | "catalognumber" => Some(ObservedValueKind::CatalogNumber),
             _ => None,
         };
         if let Some(kind) = kind {
