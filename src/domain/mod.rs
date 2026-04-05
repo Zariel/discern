@@ -1,6 +1,7 @@
 pub mod artist;
 pub mod candidate_match;
 pub mod config_snapshot;
+pub mod export_profile;
 pub mod exported_metadata_snapshot;
 pub mod file;
 pub mod import_batch;

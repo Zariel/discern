@@ -3,6 +3,10 @@ use crate::domain::candidate_match::{
     EvidenceNote, ProviderProvenance,
 };
 use crate::domain::config_snapshot::ConfigSnapshot;
+use crate::domain::export_profile::{
+    ArtworkPolicy, CompilationHandling, EditionVisibilityPolicy, ExportProfile,
+    PlayerMetadataField, QualifierVisibilityPolicy,
+};
 use crate::domain::exported_metadata_snapshot::{
     CompatibilityReport, ExportedMetadataSnapshot, QualifierVisibility,
 };
@@ -287,6 +291,47 @@ fn exported_and_operator_state_attach_without_leaking_persistence_details() {
     assert_eq!(override_record.subject, OverrideSubject::Track(track_id));
     assert_eq!(artwork.release_id, release_id);
     assert_eq!(config.release_instance_id, Some(release_instance_id));
+}
+
+#[test]
+fn generic_player_export_profile_models_default_visibility_policy() {
+    let profile = ExportProfile::generic_player();
+
+    assert_eq!(profile.name, "generic_player");
+    assert_eq!(
+        profile.edition_visibility,
+        EditionVisibilityPolicy::AlbumTitleWhenNeeded
+    );
+    assert_eq!(
+        profile.technical_visibility,
+        QualifierVisibilityPolicy::PathOnly
+    );
+    assert_eq!(
+        profile.provenance_visibility,
+        QualifierVisibilityPolicy::Hidden
+    );
+    assert_eq!(
+        profile.compilation_handling,
+        CompilationHandling::StandardCompilationTags
+    );
+    assert!(profile.write_internal_ids);
+    assert!(
+        profile
+            .exported_fields
+            .contains(&PlayerMetadataField::Album)
+    );
+    assert!(
+        profile
+            .exported_fields
+            .contains(&PlayerMetadataField::MusicBrainzIdentifiers)
+    );
+    assert_eq!(
+        profile.artwork,
+        ArtworkPolicy::SidecarFile {
+            file_name: "cover.jpg".to_string(),
+            embed_in_tags: false,
+        }
+    );
 }
 
 #[test]

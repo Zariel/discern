@@ -1,9 +1,12 @@
 use std::path::PathBuf;
 
 use crate::config::{
-    AppConfig, ArtworkConfig, ConfigValidationIssue, DiscogsConfig, DuplicatePolicy, ExportConfig,
-    ExportProfileConfig, ImportConfig, MusicBrainzConfig, PathTemplateConfig, TaggingConfig,
-    WatchDirectoryConfig, WorkerConfig,
+    AppConfig, ConfigValidationIssue, DiscogsConfig, DuplicatePolicy, ExportConfig, ImportConfig,
+    MusicBrainzConfig, WatchDirectoryConfig, WorkerConfig,
+};
+use crate::domain::export_profile::{
+    ArtworkPolicy, CompilationHandling, EditionVisibilityPolicy, ExportProfile,
+    QualifierVisibilityPolicy,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -115,20 +118,116 @@ impl From<&ImportConfig> for ImportPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportPolicy {
     pub default_profile: String,
-    pub profiles: Vec<ExportProfileConfig>,
-    pub path_templates: PathTemplateConfig,
-    pub tagging: TaggingConfig,
-    pub artwork: ArtworkConfig,
+    pub profiles: Vec<ExportProfile>,
+    pub path_templates: PathPolicy,
+    pub tagging: TaggingPolicy,
 }
 
 impl From<&ExportConfig> for ExportPolicy {
     fn from(config: &ExportConfig) -> Self {
         Self {
             default_profile: config.default_profile.clone(),
-            profiles: config.profiles.clone(),
-            path_templates: config.path_templates.clone(),
-            tagging: config.tagging.clone(),
-            artwork: config.artwork.clone(),
+            profiles: config
+                .profiles
+                .iter()
+                .map(|profile| ExportProfile::from_config(profile, &config.artwork))
+                .collect(),
+            path_templates: PathPolicy::from(&config.path_templates),
+            tagging: TaggingPolicy::from((&config.tagging, &config.artwork)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathPolicy {
+    pub release_template: String,
+    pub release_instance_template: String,
+    pub character_replacement: String,
+    pub max_path_length: usize,
+}
+
+impl From<&crate::config::PathTemplateConfig> for PathPolicy {
+    fn from(config: &crate::config::PathTemplateConfig) -> Self {
+        Self {
+            release_template: config.release_template.clone(),
+            release_instance_template: config.release_instance_template.clone(),
+            character_replacement: config.character_replacement.clone(),
+            max_path_length: config.max_path_length,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaggingPolicy {
+    pub mp3_id3v2_version: crate::config::Id3v2Version,
+    pub unknown_tag_policy: crate::config::UnknownTagPolicy,
+    pub selected_tag_keys: Vec<String>,
+    pub artwork: ArtworkPolicy,
+}
+
+impl From<(&crate::config::TaggingConfig, &crate::config::ArtworkConfig)> for TaggingPolicy {
+    fn from(
+        (tagging, artwork): (&crate::config::TaggingConfig, &crate::config::ArtworkConfig),
+    ) -> Self {
+        Self {
+            mp3_id3v2_version: tagging.mp3_id3v2_version.clone(),
+            unknown_tag_policy: tagging.unknown_tag_policy.clone(),
+            selected_tag_keys: tagging.selected_tag_keys.clone(),
+            artwork: ArtworkPolicy::from(artwork),
+        }
+    }
+}
+
+impl ExportProfile {
+    fn from_config(
+        config: &crate::config::ExportProfileConfig,
+        artwork: &crate::config::ArtworkConfig,
+    ) -> Self {
+        Self {
+            name: config.name.clone(),
+            exported_fields: ExportProfile::generic_player().exported_fields,
+            edition_visibility: match config.edition_visibility {
+                crate::config::EditionVisibilityPolicy::Hidden => EditionVisibilityPolicy::Hidden,
+                crate::config::EditionVisibilityPolicy::AlbumTitleWhenNeeded => {
+                    EditionVisibilityPolicy::AlbumTitleWhenNeeded
+                }
+                crate::config::EditionVisibilityPolicy::AlbumTitleAlways => {
+                    EditionVisibilityPolicy::AlbumTitleAlways
+                }
+            },
+            technical_visibility: map_variant_visibility(&config.technical_visibility),
+            provenance_visibility: map_variant_visibility(&config.provenance_visibility),
+            compilation_handling: match config.compilation_mode {
+                crate::config::CompilationMode::StandardCompilationTags => {
+                    CompilationHandling::StandardCompilationTags
+                }
+                crate::config::CompilationMode::AlbumArtistOnly => {
+                    CompilationHandling::AlbumArtistOnly
+                }
+            },
+            write_internal_ids: config.write_musicbrainz_ids,
+            artwork: ArtworkPolicy::from(artwork),
+        }
+    }
+}
+
+impl From<&crate::config::ArtworkConfig> for ArtworkPolicy {
+    fn from(config: &crate::config::ArtworkConfig) -> Self {
+        Self::SidecarFile {
+            file_name: config.sidecar_file_name.clone(),
+            embed_in_tags: config.embed_in_tags,
+        }
+    }
+}
+
+fn map_variant_visibility(
+    policy: &crate::config::VariantVisibilityPolicy,
+) -> QualifierVisibilityPolicy {
+    match policy {
+        crate::config::VariantVisibilityPolicy::Hidden => QualifierVisibilityPolicy::Hidden,
+        crate::config::VariantVisibilityPolicy::PathOnly => QualifierVisibilityPolicy::PathOnly,
+        crate::config::VariantVisibilityPolicy::TagsAndPath => {
+            QualifierVisibilityPolicy::TagsAndPath
         }
     }
 }
@@ -172,6 +271,9 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::config::{AppConfig, DuplicatePolicy, VariantVisibilityPolicy};
+    use crate::domain::export_profile::{
+        ArtworkPolicy, EditionVisibilityPolicy, QualifierVisibilityPolicy,
+    };
 
     use super::ValidatedRuntimeConfig;
 
@@ -192,9 +294,37 @@ mod tests {
         assert_eq!(validated.import.duplicate_policy, DuplicatePolicy::Flag);
         assert_eq!(
             validated.export.profiles[0].provenance_visibility,
-            VariantVisibilityPolicy::TagsAndPath
+            QualifierVisibilityPolicy::TagsAndPath
         );
         assert_eq!(validated.workers.provider_request_concurrency, 4);
         assert!(validated.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn validated_runtime_config_normalizes_export_profile_models() {
+        let mut config = AppConfig::default();
+        config.export.profiles[0].edition_visibility =
+            crate::config::EditionVisibilityPolicy::AlbumTitleAlways;
+        config.export.profiles[0].technical_visibility = VariantVisibilityPolicy::TagsAndPath;
+        config.export.artwork.sidecar_file_name = "front.jpg".to_string();
+        config.export.artwork.embed_in_tags = true;
+
+        let validated = ValidatedRuntimeConfig::from_validated_app_config(&config);
+
+        assert_eq!(
+            validated.export.profiles[0].edition_visibility,
+            EditionVisibilityPolicy::AlbumTitleAlways
+        );
+        assert_eq!(
+            validated.export.profiles[0].technical_visibility,
+            QualifierVisibilityPolicy::TagsAndPath
+        );
+        assert_eq!(
+            validated.export.profiles[0].artwork,
+            ArtworkPolicy::SidecarFile {
+                file_name: "front.jpg".to_string(),
+                embed_in_tags: true,
+            }
+        );
     }
 }
