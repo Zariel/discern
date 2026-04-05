@@ -1,6 +1,7 @@
 pub mod envelope;
 pub mod error;
 pub mod ingest;
+pub mod inspection;
 pub mod jobs;
 pub mod pagination;
 pub mod routes;
@@ -10,6 +11,7 @@ use crate::config::ApiConfig;
 pub use envelope::{ApiEnvelope, ApiMeta};
 pub use error::{ApiError, ApiErrorCode};
 pub use ingest::IngestApi;
+pub use inspection::InspectionApi;
 pub use jobs::JobsApi;
 pub use pagination::ApiPaginationMeta;
 pub use routes::{ApiRoute, HttpMethod};
