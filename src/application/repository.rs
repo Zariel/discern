@@ -6,6 +6,7 @@ use crate::domain::job::{Job, JobStatus, JobType};
 use crate::domain::release::Release;
 use crate::domain::release_group::ReleaseGroup;
 use crate::domain::release_instance::{FormatFamily, ReleaseInstance, ReleaseInstanceState};
+use crate::domain::source::{Source, SourceLocator};
 use crate::support::ids::{
     CandidateMatchId, ExportedMetadataSnapshotId, ImportBatchId, IssueId, JobId, ReleaseGroupId,
     ReleaseId, ReleaseInstanceId,
@@ -77,6 +78,26 @@ pub trait ImportBatchRepository {
         &self,
         query: &ImportBatchListQuery,
     ) -> Result<Page<ImportBatch>, RepositoryError>;
+}
+
+pub trait SourceRepository {
+    fn find_source_by_locator(
+        &self,
+        locator: &SourceLocator,
+    ) -> Result<Option<Source>, RepositoryError>;
+}
+
+pub trait SourceCommandRepository {
+    fn create_source(&self, source: &Source) -> Result<(), RepositoryError>;
+}
+
+pub trait ImportBatchCommandRepository {
+    fn create_import_batch(&self, batch: &ImportBatch) -> Result<(), RepositoryError>;
+
+    fn list_active_import_batches_for_source(
+        &self,
+        source_id: &crate::support::ids::SourceId,
+    ) -> Result<Vec<ImportBatch>, RepositoryError>;
 }
 
 pub trait IssueRepository {

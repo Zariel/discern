@@ -7,10 +7,11 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
 use crate::application::repository::{
-    ExportRepository, ExportedMetadataListQuery, ImportBatchListQuery, ImportBatchRepository,
-    IssueCommandRepository, IssueListQuery, IssueRepository, JobCommandRepository, JobListQuery,
-    JobRepository, ReleaseGroupSearchQuery, ReleaseInstanceListQuery, ReleaseInstanceRepository,
-    ReleaseListQuery, ReleaseRepository, RepositoryError, RepositoryErrorKind,
+    ExportRepository, ExportedMetadataListQuery, ImportBatchCommandRepository,
+    ImportBatchListQuery, ImportBatchRepository, IssueCommandRepository, IssueListQuery,
+    IssueRepository, JobCommandRepository, JobListQuery, JobRepository, ReleaseGroupSearchQuery,
+    ReleaseInstanceListQuery, ReleaseInstanceRepository, ReleaseListQuery, ReleaseRepository,
+    RepositoryError, RepositoryErrorKind, SourceCommandRepository, SourceRepository,
 };
 use crate::domain::candidate_match::{
     CandidateMatch, CandidateProvider, CandidateScore, CandidateSubject, EvidenceKind,
@@ -28,6 +29,7 @@ use crate::domain::release_instance::{
     BitrateMode, FormatFamily, GazelleReference, IngestOrigin, ProvenanceSnapshot, ReleaseInstance,
     ReleaseInstanceState, TechnicalVariant,
 };
+use crate::domain::source::{Source, SourceKind, SourceLocator};
 use crate::support::ids::{
     ArtistId, CandidateMatchId, DiscogsReleaseId, ExportedMetadataSnapshotId, ImportBatchId,
     IssueId, JobId, MusicBrainzReleaseGroupId, MusicBrainzReleaseId, ReleaseGroupId, ReleaseId,
@@ -484,6 +486,116 @@ impl ImportBatchRepository for SqliteRepositories {
             request: query.page,
             total: total as u64,
         })
+    }
+}
+
+impl SourceRepository for SqliteRepositories {
+    fn find_source_by_locator(
+        &self,
+        locator: &SourceLocator,
+    ) -> Result<Option<Source>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        let (locator_kind, locator_value) = source_locator_to_sql(locator);
+        connection
+            .query_row(
+                "SELECT id, kind, display_name, locator_kind, locator_value, external_reference
+                 FROM sources
+                 WHERE locator_kind = ?1 AND locator_value = ?2",
+                params![locator_kind, locator_value],
+                map_source,
+            )
+            .optional()
+            .map_err(to_storage_error)
+    }
+}
+
+impl SourceCommandRepository for SqliteRepositories {
+    fn create_source(&self, source: &Source) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            let (locator_kind, locator_value) = source_locator_to_sql(&source.locator);
+            transaction
+                .execute(
+                    "INSERT INTO sources
+                     (id, kind, display_name, locator_kind, locator_value, external_reference)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        source.id.as_uuid().to_string(),
+                        source_kind_to_sql(&source.kind),
+                        &source.display_name,
+                        locator_kind,
+                        locator_value,
+                        &source.external_reference,
+                    ],
+                )
+                .map_err(to_storage_error)?;
+            Ok(())
+        })
+    }
+}
+
+impl ImportBatchCommandRepository for SqliteRepositories {
+    fn create_import_batch(&self, batch: &ImportBatch) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO import_batches
+                     (id, source_id, mode, status, requested_by_kind, requested_by_name,
+                      created_at_unix_seconds)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        batch.id.as_uuid().to_string(),
+                        batch.source_id.as_uuid().to_string(),
+                        import_mode_to_sql(&batch.mode),
+                        import_batch_status_to_sql(&batch.status),
+                        batch_requester_kind_to_sql(&batch.requested_by),
+                        batch_requester_name_to_sql(&batch.requested_by),
+                        batch.created_at_unix_seconds,
+                    ],
+                )
+                .map_err(to_storage_error)?;
+
+            for (ordinal, path) in batch.received_paths.iter().enumerate() {
+                transaction
+                    .execute(
+                        "INSERT INTO import_batch_paths (import_batch_id, ordinal, path)
+                         VALUES (?1, ?2, ?3)",
+                        params![
+                            batch.id.as_uuid().to_string(),
+                            ordinal as i64,
+                            path.to_string_lossy().to_string(),
+                        ],
+                    )
+                    .map_err(to_storage_error)?;
+            }
+
+            Ok(())
+        })
+    }
+
+    fn list_active_import_batches_for_source(
+        &self,
+        source_id: &SourceId,
+    ) -> Result<Vec<ImportBatch>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, source_id, mode, status, requested_by_kind,
+                        requested_by_name, created_at_unix_seconds
+                 FROM import_batches
+                 WHERE source_id = ?1
+                   AND status IN ('created', 'discovering', 'grouped', 'submitted')
+                 ORDER BY created_at_unix_seconds DESC",
+            )
+            .map_err(to_storage_error)?;
+        let mut items = statement
+            .query_map(params![source_id.as_uuid().to_string()], map_import_batch)
+            .map_err(to_storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_storage_error)?;
+        for batch in &mut items {
+            batch.received_paths = load_import_batch_paths(&connection, &batch.id)?;
+        }
+        Ok(items)
     }
 }
 
@@ -996,6 +1108,19 @@ fn map_import_batch(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImportBatch> {
     })
 }
 
+fn map_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
+    let locator_kind = row.get::<_, String>(3)?;
+    let locator_value = row.get::<_, String>(4)?;
+    Ok(Source {
+        id: parse_uuid_id::<SourceId>(row.get_ref(0)?, 0)?,
+        kind: parse_source_kind(row.get(1)?),
+        display_name: row.get(2)?,
+        locator: parse_source_locator(locator_kind, locator_value)
+            .map_err(|error| invalid_column(4, error))?,
+        external_reference: row.get(5)?,
+    })
+}
+
 fn map_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
     let subject_kind: String = row.get(3)?;
     let subject_id: Option<String> = row.get(4)?;
@@ -1307,6 +1432,14 @@ fn parse_import_mode(value: String) -> ImportMode {
     }
 }
 
+fn import_mode_to_sql(value: &ImportMode) -> &'static str {
+    match value {
+        ImportMode::Copy => "copy",
+        ImportMode::Move => "move",
+        ImportMode::Hardlink => "hardlink",
+    }
+}
+
 fn parse_import_batch_status(value: String) -> ImportBatchStatus {
     match value.as_str() {
         "created" => ImportBatchStatus::Created,
@@ -1315,6 +1448,17 @@ fn parse_import_batch_status(value: String) -> ImportBatchStatus {
         "submitted" => ImportBatchStatus::Submitted,
         "quarantined" => ImportBatchStatus::Quarantined,
         _ => ImportBatchStatus::Failed,
+    }
+}
+
+fn import_batch_status_to_sql(value: &ImportBatchStatus) -> &'static str {
+    match value {
+        ImportBatchStatus::Created => "created",
+        ImportBatchStatus::Discovering => "discovering",
+        ImportBatchStatus::Grouped => "grouped",
+        ImportBatchStatus::Submitted => "submitted",
+        ImportBatchStatus::Quarantined => "quarantined",
+        ImportBatchStatus::Failed => "failed",
     }
 }
 
@@ -1327,6 +1471,79 @@ fn parse_batch_requester(kind: String, name: Option<String>) -> BatchRequester {
         _ => BatchRequester::ExternalClient {
             name: name.unwrap_or_else(|| "external".to_string()),
         },
+    }
+}
+
+fn batch_requester_kind_to_sql(value: &BatchRequester) -> &'static str {
+    match value {
+        BatchRequester::System => "system",
+        BatchRequester::Operator { .. } => "operator",
+        BatchRequester::ExternalClient { .. } => "external_client",
+    }
+}
+
+fn batch_requester_name_to_sql(value: &BatchRequester) -> Option<String> {
+    match value {
+        BatchRequester::System => None,
+        BatchRequester::Operator { name } => Some(name.clone()),
+        BatchRequester::ExternalClient { name } => Some(name.clone()),
+    }
+}
+
+fn parse_source_kind(value: String) -> SourceKind {
+    match value.as_str() {
+        "watch_directory" => SourceKind::WatchDirectory,
+        "api_client" => SourceKind::ApiClient,
+        "manual_add" => SourceKind::ManualAdd,
+        _ => SourceKind::Gazelle,
+    }
+}
+
+fn source_kind_to_sql(value: &SourceKind) -> &'static str {
+    match value {
+        SourceKind::WatchDirectory => "watch_directory",
+        SourceKind::ApiClient => "api_client",
+        SourceKind::ManualAdd => "manual_add",
+        SourceKind::Gazelle => "gazelle",
+    }
+}
+
+fn parse_source_locator(kind: String, value: String) -> Result<SourceLocator, String> {
+    match kind.as_str() {
+        "filesystem_path" => Ok(SourceLocator::FilesystemPath(value.into())),
+        "api_client" => Ok(SourceLocator::ApiClient { client_name: value }),
+        "manual_entry" => Ok(SourceLocator::ManualEntry {
+            submitted_path: value.into(),
+        }),
+        "tracker_ref" => {
+            let mut parts = value.splitn(2, ':');
+            let tracker = parts.next().unwrap_or_default().to_string();
+            let identifier = parts
+                .next()
+                .ok_or_else(|| format!("invalid tracker_ref locator '{value}'"))?
+                .to_string();
+            Ok(SourceLocator::TrackerRef {
+                tracker,
+                identifier,
+            })
+        }
+        other => Err(format!("unknown source locator kind '{other}'")),
+    }
+}
+
+fn source_locator_to_sql(locator: &SourceLocator) -> (&'static str, String) {
+    match locator {
+        SourceLocator::FilesystemPath(path) => {
+            ("filesystem_path", path.to_string_lossy().to_string())
+        }
+        SourceLocator::ApiClient { client_name } => ("api_client", client_name.clone()),
+        SourceLocator::ManualEntry { submitted_path } => {
+            ("manual_entry", submitted_path.to_string_lossy().to_string())
+        }
+        SourceLocator::TrackerRef {
+            tracker,
+            identifier,
+        } => ("tracker_ref", format!("{tracker}:{identifier}")),
     }
 }
 
