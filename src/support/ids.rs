@@ -16,6 +16,10 @@ macro_rules! strong_id {
                 Self(Uuid::new_v4())
             }
 
+            pub fn parse_str(value: &str) -> Result<Self, uuid::Error> {
+                Uuid::parse_str(value).map(Self)
+            }
+
             pub fn as_uuid(&self) -> &Uuid {
                 &self.0
             }
