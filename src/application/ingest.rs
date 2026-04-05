@@ -32,6 +32,13 @@ pub struct WatchDiscoveryReport {
     pub skipped_paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestSubmissionReport {
+    pub source: Source,
+    pub batch: ImportBatch,
+    pub job: Job,
+}
+
 pub struct WatchDiscoveryService<R> {
     repository: R,
     config: ValidatedRuntimeConfig,
@@ -50,6 +57,68 @@ where
         + ImportBatchCommandRepository
         + JobCommandRepository,
 {
+    pub fn submit_api_paths(
+        &self,
+        client_name: impl Into<String>,
+        submitted_paths: Vec<PathBuf>,
+        submitted_at_unix_seconds: i64,
+    ) -> Result<IngestSubmissionReport, WatchDiscoveryError> {
+        let client_name = client_name.into();
+        let locator = SourceLocator::ApiClient {
+            client_name: client_name.clone(),
+        };
+        let source = self.find_or_create_source(
+            SourceKind::ApiClient,
+            client_name.clone(),
+            locator,
+            Some(client_name.clone()),
+        )?;
+
+        let batch = self.create_submission_batch(
+            source.clone(),
+            self.config.import.default_mode.clone(),
+            BatchRequester::ExternalClient { name: client_name },
+            submitted_paths,
+            submitted_at_unix_seconds,
+        )?;
+        let job =
+            self.queue_discover_batch_job(&batch, JobTrigger::System, submitted_at_unix_seconds)?;
+
+        Ok(IngestSubmissionReport { source, batch, job })
+    }
+
+    pub fn submit_manual_path(
+        &self,
+        operator_name: impl Into<String>,
+        submitted_path: PathBuf,
+        submitted_at_unix_seconds: i64,
+    ) -> Result<IngestSubmissionReport, WatchDiscoveryError> {
+        let operator_name = operator_name.into();
+        let locator = SourceLocator::ManualEntry {
+            submitted_path: submitted_path.clone(),
+        };
+        let source = self.find_or_create_source(
+            SourceKind::ManualAdd,
+            format!("manual:{operator_name}"),
+            locator,
+            None,
+        )?;
+
+        let batch = self.create_submission_batch(
+            source.clone(),
+            self.config.import.default_mode.clone(),
+            BatchRequester::Operator {
+                name: operator_name,
+            },
+            vec![submitted_path],
+            submitted_at_unix_seconds,
+        )?;
+        let job =
+            self.queue_discover_batch_job(&batch, JobTrigger::Operator, submitted_at_unix_seconds)?;
+
+        Ok(IngestSubmissionReport { source, batch, job })
+    }
+
     pub fn discover_watch_batches(
         &self,
         discovered_at_unix_seconds: i64,
@@ -80,31 +149,21 @@ where
                     continue;
                 }
 
-                let batch = ImportBatch {
-                    id: crate::support::ids::ImportBatchId::new(),
-                    source_id: source.id.clone(),
-                    mode: watcher
+                let batch = self.create_submission_batch(
+                    source.clone(),
+                    watcher
                         .import_mode_override
                         .clone()
                         .unwrap_or_else(|| self.config.import.default_mode.clone()),
-                    status: ImportBatchStatus::Created,
-                    requested_by: BatchRequester::System,
-                    created_at_unix_seconds: discovered_at_unix_seconds,
-                    received_paths: vec![candidate_path.clone()],
-                };
-                self.repository
-                    .create_import_batch(&batch)
-                    .map_err(map_repository_error)?;
-
-                let job = Job::queued(
-                    JobType::DiscoverBatch,
-                    JobSubject::ImportBatch(batch.id.clone()),
+                    BatchRequester::System,
+                    vec![candidate_path.clone()],
+                    discovered_at_unix_seconds,
+                )?;
+                let job = self.queue_discover_batch_job(
+                    &batch,
                     JobTrigger::System,
                     discovered_at_unix_seconds,
-                );
-                self.repository
-                    .create_job(&job)
-                    .map_err(map_repository_error)?;
+                )?;
 
                 report.created_batches.push(batch);
                 report.queued_jobs.push(job);
@@ -118,7 +177,21 @@ where
         &self,
         watcher: &WatchDirectoryPolicy,
     ) -> Result<Source, WatchDiscoveryError> {
-        let locator = SourceLocator::FilesystemPath(watcher.path.clone());
+        self.find_or_create_source(
+            SourceKind::WatchDirectory,
+            watcher.name.clone(),
+            SourceLocator::FilesystemPath(watcher.path.clone()),
+            None,
+        )
+    }
+
+    fn find_or_create_source(
+        &self,
+        kind: SourceKind,
+        display_name: impl Into<String>,
+        locator: SourceLocator,
+        external_reference: Option<String>,
+    ) -> Result<Source, WatchDiscoveryError> {
         if let Some(source) = self
             .repository
             .find_source_by_locator(&locator)
@@ -129,15 +202,59 @@ where
 
         let source = Source {
             id: crate::support::ids::SourceId::new(),
-            kind: SourceKind::WatchDirectory,
-            display_name: watcher.name.clone(),
+            kind,
+            display_name: display_name.into(),
             locator,
-            external_reference: None,
+            external_reference,
         };
         self.repository
             .create_source(&source)
             .map_err(map_repository_error)?;
         Ok(source)
+    }
+
+    fn create_submission_batch(
+        &self,
+        source: Source,
+        mode: crate::domain::import_batch::ImportMode,
+        requested_by: BatchRequester,
+        submitted_paths: Vec<PathBuf>,
+        created_at_unix_seconds: i64,
+    ) -> Result<ImportBatch, WatchDiscoveryError> {
+        let batch = ImportBatch {
+            id: crate::support::ids::ImportBatchId::new(),
+            source_id: source.id,
+            mode,
+            status: ImportBatchStatus::Created,
+            requested_by,
+            created_at_unix_seconds,
+            received_paths: submitted_paths
+                .into_iter()
+                .map(|path| normalize_path(&path))
+                .collect(),
+        };
+        self.repository
+            .create_import_batch(&batch)
+            .map_err(map_repository_error)?;
+        Ok(batch)
+    }
+
+    fn queue_discover_batch_job(
+        &self,
+        batch: &ImportBatch,
+        triggered_by: JobTrigger,
+        created_at_unix_seconds: i64,
+    ) -> Result<Job, WatchDiscoveryError> {
+        let job = Job::queued(
+            JobType::DiscoverBatch,
+            JobSubject::ImportBatch(batch.id.clone()),
+            triggered_by,
+            created_at_unix_seconds,
+        );
+        self.repository
+            .create_job(&job)
+            .map_err(map_repository_error)?;
+        Ok(job)
     }
 }
 
@@ -359,6 +476,73 @@ mod tests {
         assert_eq!(second.skipped_paths, vec![temp_root.join("album")]);
 
         cleanup_root(temp_root);
+    }
+
+    #[test]
+    fn service_submits_api_paths_without_guessing_identity() {
+        let repository = InMemoryIngestRepository::default();
+        let config =
+            ValidatedRuntimeConfig::from_validated_app_config(&crate::config::AppConfig::default());
+        let service = WatchDiscoveryService::new(repository.clone(), config);
+
+        let report = service
+            .submit_api_paths(
+                "lidarr",
+                vec![
+                    PathBuf::from("/imports/api/release-a"),
+                    PathBuf::from("/imports/api/release-b"),
+                ],
+                200,
+            )
+            .expect("api intake should succeed");
+
+        assert_eq!(report.source.kind, SourceKind::ApiClient);
+        assert_eq!(
+            report.source.locator,
+            SourceLocator::ApiClient {
+                client_name: "lidarr".to_string()
+            }
+        );
+        assert_eq!(
+            report.batch.requested_by,
+            BatchRequester::ExternalClient {
+                name: "lidarr".to_string()
+            }
+        );
+        assert_eq!(report.batch.received_paths.len(), 2);
+        assert_eq!(report.job.job_type, JobType::DiscoverBatch);
+        assert_eq!(report.job.triggered_by, JobTrigger::System);
+    }
+
+    #[test]
+    fn service_submits_manual_path_with_operator_source() {
+        let repository = InMemoryIngestRepository::default();
+        let config =
+            ValidatedRuntimeConfig::from_validated_app_config(&crate::config::AppConfig::default());
+        let service = WatchDiscoveryService::new(repository.clone(), config);
+
+        let report = service
+            .submit_manual_path("chris", PathBuf::from("/imports/manual/drop"), 300)
+            .expect("manual intake should succeed");
+
+        assert_eq!(report.source.kind, SourceKind::ManualAdd);
+        assert_eq!(
+            report.source.locator,
+            SourceLocator::ManualEntry {
+                submitted_path: PathBuf::from("/imports/manual/drop")
+            }
+        );
+        assert_eq!(
+            report.batch.requested_by,
+            BatchRequester::Operator {
+                name: "chris".to_string()
+            }
+        );
+        assert_eq!(
+            report.batch.received_paths,
+            vec![PathBuf::from("/imports/manual/drop")]
+        );
+        assert_eq!(report.job.triggered_by, JobTrigger::Operator);
     }
 
     #[derive(Clone, Default)]
