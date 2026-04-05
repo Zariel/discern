@@ -38,7 +38,7 @@ pub fn bootstrap(config: AppConfig) -> Result<Runtime, RuntimeBootstrapError> {
     let infrastructure = Infrastructure::from_config(&config.storage);
 
     Ok(Runtime {
-        application: ApplicationContext::new(&config.workers),
+        application: ApplicationContext::new(&config),
         api: ApiSurface::from_config(&config.api),
         web: WebSurface::from_config(&config.web),
         infrastructure,
@@ -58,6 +58,15 @@ mod tests {
 
         assert_eq!(runtime.api.base_path, "/api");
         assert_eq!(runtime.web.mount_path, "/");
+        assert!(runtime.application.config.diagnostics.is_empty());
+        assert_eq!(
+            runtime.application.config.import.default_mode,
+            runtime.config.import.default_mode
+        );
+        assert_eq!(
+            runtime.application.config.export.default_profile,
+            runtime.config.export.default_profile
+        );
         assert_eq!(runtime.application.workers.file_io.limit(), 2);
         assert_eq!(runtime.application.workers.provider_requests.limit(), 2);
         assert_eq!(runtime.application.workers.db_writes.limit(), 1);
