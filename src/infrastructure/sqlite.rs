@@ -102,6 +102,15 @@ impl SqliteRepositoryContext {
         &self.database_path
     }
 
+    pub fn ensure_schema(&self) -> Result<(), RepositoryError> {
+        self.with_write_transaction(|transaction| {
+            if schema_is_initialized(transaction)? {
+                return Ok(());
+            }
+            apply_initial_schema(transaction)
+        })
+    }
+
     pub fn read_connection(&self) -> Result<Connection, RepositoryError> {
         let connection = Connection::open(&self.database_path)
             .map_err(|error| storage_error(format!("failed to open sqlite reader: {error}")))?;
@@ -3602,6 +3611,31 @@ fn to_storage_error(error: rusqlite::Error) -> RepositoryError {
     storage_error(error.to_string())
 }
 
+fn schema_is_initialized(transaction: &Transaction<'_>) -> Result<bool, RepositoryError> {
+    let present = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'jobs'
+             )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(to_storage_error)?;
+    Ok(present == 1)
+}
+
+fn apply_initial_schema(transaction: &Transaction<'_>) -> Result<(), RepositoryError> {
+    transaction
+        .execute_batch(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/0001_initial_schema.up.sql"
+        )))
+        .map_err(to_storage_error)?;
+    Ok(())
+}
+
 #[derive(Debug)]
 struct SimpleError(String);
 
@@ -3664,7 +3698,7 @@ mod tests {
 
         context
             .with_write_transaction(|transaction| {
-                apply_migrations(transaction)?;
+                apply_initial_schema(transaction)?;
                 Ok(())
             })
             .expect("migrations should apply");
@@ -4224,7 +4258,7 @@ mod tests {
         let context = SqliteRepositoryContext::open(&database_path).expect("context should open");
         context
             .with_write_transaction(|transaction| {
-                apply_migrations(transaction)?;
+                apply_initial_schema(transaction)?;
                 Ok(())
             })
             .expect("migrations should apply");
@@ -4297,7 +4331,7 @@ mod tests {
         let context = SqliteRepositoryContext::open(&database_path).expect("context should open");
         context
             .with_write_transaction(|transaction| {
-                apply_migrations(transaction)?;
+                apply_initial_schema(transaction)?;
                 seed_rows(transaction)?;
                 Ok(())
             })
@@ -4605,16 +4639,6 @@ mod tests {
             )
             .map_err(to_storage_error)?;
 
-        Ok(())
-    }
-
-    fn apply_migrations(transaction: &Transaction<'_>) -> Result<(), RepositoryError> {
-        transaction
-            .execute_batch(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/migrations/0001_initial_schema.up.sql"
-            )))
-            .map_err(to_storage_error)?;
         Ok(())
     }
 
