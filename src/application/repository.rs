@@ -2,7 +2,7 @@ use crate::domain::candidate_match::CandidateMatch;
 use crate::domain::exported_metadata_snapshot::ExportedMetadataSnapshot;
 use crate::domain::import_batch::ImportBatch;
 use crate::domain::ingest_evidence::IngestEvidenceRecord;
-use crate::domain::issue::{Issue, IssueState, IssueType};
+use crate::domain::issue::{Issue, IssueState, IssueSubject, IssueType};
 use crate::domain::job::{Job, JobStatus, JobType};
 use crate::domain::metadata_snapshot::MetadataSnapshot;
 use crate::domain::release::Release;
@@ -258,6 +258,7 @@ pub struct ImportBatchListQuery {
 pub struct IssueListQuery {
     pub state: Option<IssueState>,
     pub issue_type: Option<IssueType>,
+    pub subject: Option<IssueSubject>,
     pub page: PageRequest,
 }
 

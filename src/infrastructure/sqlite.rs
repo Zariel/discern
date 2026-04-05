@@ -1104,13 +1104,22 @@ impl IssueRepository for SqliteRepositories {
         let connection = self.context.read_connection()?;
         let state = query.state.as_ref().map(issue_state_to_sql);
         let issue_type = query.issue_type.as_ref().map(issue_type_to_sql);
+        let subject_kind = query.subject.as_ref().map(issue_subject_kind_to_sql);
+        let subject_id = query.subject.as_ref().and_then(issue_subject_id_to_sql);
         let total: i64 = connection
             .query_row(
                 "SELECT COUNT(*)
                  FROM issues
                  WHERE (?1 IS NULL OR state = ?1)
-                   AND (?2 IS NULL OR issue_type = ?2)",
-                params![state.as_deref(), issue_type.as_deref()],
+                   AND (?2 IS NULL OR issue_type = ?2)
+                   AND (?3 IS NULL OR subject_kind = ?3)
+                   AND (?4 IS NULL OR subject_id = ?4)",
+                params![
+                    state.as_deref(),
+                    issue_type.as_deref(),
+                    subject_kind,
+                    subject_id,
+                ],
                 |row| row.get(0),
             )
             .map_err(to_storage_error)?;
@@ -1122,8 +1131,10 @@ impl IssueRepository for SqliteRepositories {
                  FROM issues
                  WHERE (?1 IS NULL OR state = ?1)
                    AND (?2 IS NULL OR issue_type = ?2)
+                   AND (?3 IS NULL OR subject_kind = ?3)
+                   AND (?4 IS NULL OR subject_id = ?4)
                  ORDER BY created_at_unix_seconds DESC
-                 LIMIT ?3 OFFSET ?4",
+                 LIMIT ?5 OFFSET ?6",
             )
             .map_err(to_storage_error)?;
         let items = statement
@@ -1131,6 +1142,8 @@ impl IssueRepository for SqliteRepositories {
                 params![
                     state.as_deref(),
                     issue_type.as_deref(),
+                    subject_kind,
+                    subject_id,
                     i64::from(query.page.limit),
                     query.page.offset as i64,
                 ],
@@ -2906,7 +2919,7 @@ mod tests {
         CandidateMatch, CandidateProvider, CandidateScore, CandidateSubject, EvidenceKind,
         EvidenceNote, ProviderProvenance,
     };
-    use crate::domain::issue::IssueState;
+    use crate::domain::issue::{IssueState, IssueSubject, IssueType};
     use crate::domain::job::{JobStatus, JobSubject, JobTrigger, JobType};
     use crate::domain::metadata_snapshot::{MetadataSnapshotSource, SnapshotFormat};
     use crate::domain::release_instance::{
@@ -3179,6 +3192,21 @@ mod tests {
             .expect("query should succeed");
         assert_eq!(issues.total, 1);
         assert_eq!(issues.items[0].summary, "Duplicate import detected");
+
+        let release_instance_issues = repositories
+            .list_issues(&IssueListQuery {
+                issue_type: Some(IssueType::DuplicateReleaseInstance),
+                subject: Some(IssueSubject::ReleaseInstance(parse_uuid(
+                    SeedIds::RELEASE_INSTANCE,
+                ))),
+                ..IssueListQuery::default()
+            })
+            .expect("query should succeed");
+        assert_eq!(release_instance_issues.total, 1);
+        assert_eq!(
+            release_instance_issues.items[0].summary,
+            "Duplicate import detected"
+        );
 
         let jobs = repositories
             .list_jobs(&JobListQuery {

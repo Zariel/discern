@@ -3,9 +3,10 @@ use std::future::Future;
 use std::path::PathBuf;
 
 use crate::application::repository::{
-    ImportBatchRepository, IngestEvidenceRepository, MetadataSnapshotCommandRepository,
-    ReleaseInstanceCommandRepository, ReleaseInstanceRepository, RepositoryError,
-    RepositoryErrorKind, SourceRepository, StagingManifestRepository,
+    ImportBatchRepository, IngestEvidenceRepository, IssueCommandRepository, IssueListQuery,
+    IssueRepository, MetadataSnapshotCommandRepository, ReleaseInstanceCommandRepository,
+    ReleaseInstanceRepository, RepositoryError, RepositoryErrorKind, SourceRepository,
+    StagingManifestRepository,
 };
 use crate::domain::candidate_match::{
     CandidateMatch, CandidateProvider, CandidateScore, CandidateSubject, EvidenceKind,
@@ -15,6 +16,7 @@ use crate::domain::import_batch::ImportBatch;
 use crate::domain::ingest_evidence::{
     IngestEvidenceRecord, IngestEvidenceSubject, ObservedValueKind,
 };
+use crate::domain::issue::{Issue, IssueState, IssueSubject, IssueType};
 use crate::domain::metadata_snapshot::{
     MetadataSnapshot, MetadataSnapshotSource, MetadataSubject, SnapshotFormat,
 };
@@ -25,6 +27,7 @@ use crate::domain::release_instance::{
 use crate::domain::source::{Source, SourceKind};
 use crate::domain::staging_manifest::{StagedReleaseGroup, StagingManifest};
 use crate::support::ids::{CandidateMatchId, ImportBatchId, ReleaseInstanceId};
+use crate::support::pagination::PageRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchingServiceError {
@@ -246,6 +249,8 @@ impl<R, P> ReleaseMatchingService<R, P>
 where
     R: ImportBatchRepository
         + IngestEvidenceRepository
+        + IssueCommandRepository
+        + IssueRepository
         + MetadataSnapshotCommandRepository
         + ReleaseInstanceCommandRepository
         + ReleaseInstanceRepository
@@ -336,6 +341,12 @@ where
             self.repository
                 .update_release_instance(&updated_instance)
                 .map_err(map_repository_error)?;
+            synchronize_review_issues(
+                &self.repository,
+                &updated_instance,
+                &persisted_candidates,
+                persisted_at_unix_seconds,
+            )?;
 
             groups.push(PersistedGroupMatch {
                 release_instance: updated_instance,
@@ -1192,6 +1203,144 @@ fn needs_review(candidates: &[CandidateMatch]) -> bool {
         .any(|candidate| best.normalized_score.value() - candidate.normalized_score.value() <= 0.05)
 }
 
+fn review_issue_type(candidates: &[CandidateMatch]) -> Option<IssueType> {
+    let best = candidates.first()?;
+    let competing_release = candidates.iter().skip(1).any(|candidate| {
+        matches!(candidate.subject, CandidateSubject::Release { .. })
+            && best.normalized_score.value() - candidate.normalized_score.value() <= 0.05
+    });
+
+    if !matches!(best.subject, CandidateSubject::Release { .. })
+        || best.normalized_score.value() < 0.80
+    {
+        return Some(IssueType::UnmatchedRelease);
+    }
+
+    if !best.unresolved_ambiguities.is_empty() || competing_release {
+        return Some(IssueType::AmbiguousReleaseMatch);
+    }
+
+    None
+}
+
+fn synchronize_review_issues<R>(
+    repository: &R,
+    release_instance: &ReleaseInstance,
+    candidates: &[CandidateMatch],
+    changed_at_unix_seconds: i64,
+) -> Result<(), MatchingServiceError>
+where
+    R: IssueRepository + IssueCommandRepository,
+{
+    let desired_issue = review_issue_type(candidates);
+    let subject = IssueSubject::ReleaseInstance(release_instance.id.clone());
+
+    for issue_type in [
+        IssueType::UnmatchedRelease,
+        IssueType::AmbiguousReleaseMatch,
+    ] {
+        let existing = repository
+            .list_issues(&IssueListQuery {
+                state: None,
+                issue_type: Some(issue_type.clone()),
+                subject: Some(subject.clone()),
+                page: PageRequest::new(20, 0),
+            })
+            .map_err(map_repository_error)?;
+
+        for mut issue in existing.items {
+            if issue.state != IssueState::Open {
+                continue;
+            }
+
+            if desired_issue.as_ref() == Some(&issue_type) {
+                let (summary, details) = build_review_issue_content(release_instance, candidates);
+                if issue.summary != summary || issue.details != Some(details.clone()) {
+                    issue.summary = summary;
+                    issue.details = Some(details);
+                    repository
+                        .update_issue(&issue)
+                        .map_err(map_repository_error)?;
+                }
+            } else {
+                issue
+                    .resolve(changed_at_unix_seconds)
+                    .map_err(map_issue_lifecycle_error)?;
+                repository
+                    .update_issue(&issue)
+                    .map_err(map_repository_error)?;
+            }
+        }
+    }
+
+    if let Some(issue_type) = desired_issue {
+        let existing_open = repository
+            .list_issues(&IssueListQuery {
+                state: Some(IssueState::Open),
+                issue_type: Some(issue_type.clone()),
+                subject: Some(subject.clone()),
+                page: PageRequest::new(1, 0),
+            })
+            .map_err(map_repository_error)?;
+        if existing_open.items.is_empty() {
+            let (summary, details) = build_review_issue_content(release_instance, candidates);
+            repository
+                .create_issue(&Issue::open(
+                    issue_type,
+                    subject,
+                    summary,
+                    Some(details),
+                    changed_at_unix_seconds,
+                ))
+                .map_err(map_repository_error)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_review_issue_content(
+    release_instance: &ReleaseInstance,
+    candidates: &[CandidateMatch],
+) -> (String, String) {
+    let path = release_instance.provenance.original_source_path.clone();
+    match review_issue_type(candidates) {
+        Some(IssueType::UnmatchedRelease) => {
+            let best_score = candidates
+                .first()
+                .map(|candidate| format!("{:.2}", candidate.normalized_score.value()))
+                .unwrap_or_else(|| "none".to_string());
+            (
+                format!("Release match unresolved for {path}"),
+                format!(
+                    "No canonical MusicBrainz release cleared the review threshold. Best score: {best_score}."
+                ),
+            )
+        }
+        Some(IssueType::AmbiguousReleaseMatch) => {
+            let candidate_count = candidates
+                .iter()
+                .filter(|candidate| matches!(candidate.subject, CandidateSubject::Release { .. }))
+                .count();
+            let ambiguity_count = candidates
+                .first()
+                .map(|candidate| candidate.unresolved_ambiguities.len())
+                .unwrap_or_default();
+            (
+                format!("Release match is ambiguous for {path}"),
+                format!(
+                    "Found {candidate_count} competing release candidates with {ambiguity_count} unresolved ambiguity notes."
+                ),
+            )
+        }
+        None => (
+            format!("Release review cleared for {path}"),
+            "Matching no longer requires operator review.".to_string(),
+        ),
+        _ => unreachable!("review issues are limited to unmatched and ambiguous releases"),
+    }
+}
+
 fn build_discogs_query(summary: &MatchEvidenceSummary) -> DiscogsReleaseQuery {
     DiscogsReleaseQuery {
         text: summary
@@ -1403,6 +1552,28 @@ fn map_provider_error(message: String) -> MatchingServiceError {
     }
 }
 
+fn map_issue_lifecycle_error(
+    error: crate::domain::issue::IssueLifecycleError,
+) -> MatchingServiceError {
+    MatchingServiceError {
+        kind: MatchingServiceErrorKind::Conflict,
+        message: match error {
+            crate::domain::issue::IssueLifecycleError::AlreadyResolved => {
+                "issue is already resolved".to_string()
+            }
+            crate::domain::issue::IssueLifecycleError::AlreadySuppressed => {
+                "issue is already suppressed".to_string()
+            }
+            crate::domain::issue::IssueLifecycleError::ResolvedIssueCannotBeSuppressed => {
+                "resolved issues cannot be suppressed".to_string()
+            }
+            crate::domain::issue::IssueLifecycleError::SuppressedIssueCannotBeResolved => {
+                "suppressed issues cannot be resolved".to_string()
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1410,7 +1581,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::application::repository::{
-        ImportBatchRepository, MetadataSnapshotCommandRepository, ReleaseInstanceCommandRepository,
+        ImportBatchRepository, IssueCommandRepository, IssueListQuery, IssueRepository,
+        MetadataSnapshotCommandRepository, ReleaseInstanceCommandRepository,
         ReleaseInstanceRepository, SourceRepository,
     };
     use crate::domain::candidate_match::CandidateMatch;
@@ -1418,6 +1590,7 @@ mod tests {
     use crate::domain::ingest_evidence::{
         IngestEvidenceRecord, IngestEvidenceSource, IngestEvidenceSubject, ObservedValue,
     };
+    use crate::domain::issue::{Issue, IssueState, IssueSubject, IssueType};
     use crate::domain::release_instance::{ReleaseInstance, ReleaseInstanceState};
     use crate::domain::source::{Source, SourceKind, SourceLocator};
     use crate::domain::staging_manifest::{
@@ -1427,6 +1600,7 @@ mod tests {
         CandidateMatchId, ImportBatchId, IngestEvidenceId, ReleaseInstanceId, SourceId,
         StagingManifestId,
     };
+    use crate::support::pagination::{Page, PageRequest};
 
     #[test]
     fn evidence_summary_prefers_embedded_tags_over_yaml_conflicts() {
@@ -1581,6 +1755,91 @@ mod tests {
                 } if provider_id == "release-strong"
             )
         }));
+        let issues = repository.issues_for(
+            IssueSubject::ReleaseInstance(report.groups[0].release_instance.id.clone()),
+            IssueType::AmbiguousReleaseMatch,
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].state, IssueState::Open);
+    }
+
+    #[tokio::test]
+    async fn scoring_opens_unmatched_issue_for_weak_candidates() {
+        let batch_id = ImportBatchId::new();
+        let repository = InMemoryMatchingRepository::with_batch(batch_id.clone());
+        let provider =
+            FakeMusicBrainzProvider::with_release_candidates(vec![MusicBrainzReleaseCandidate {
+                id: "release-weak".to_string(),
+                title: "Kid A Tribute".to_string(),
+                score: 40,
+                artist_names: vec!["Various Artists".to_string()],
+                release_group_id: Some("group-weak".to_string()),
+                release_group_title: Some("Kid A Tribute".to_string()),
+                country: Some("US".to_string()),
+                date: Some("2001-01-01".to_string()),
+                track_count: Some(14),
+            }]);
+        let service = ReleaseMatchingService::new(repository.clone(), provider);
+
+        let report = service
+            .score_and_persist_batch_matches(&batch_id, 90)
+            .await
+            .expect("candidate scoring should succeed");
+
+        let issues = repository.issues_for(
+            IssueSubject::ReleaseInstance(report.groups[0].release_instance.id.clone()),
+            IssueType::UnmatchedRelease,
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].state, IssueState::Open);
+        assert!(issues[0].summary.contains("unresolved"));
+    }
+
+    #[tokio::test]
+    async fn rescoring_resolves_open_review_issue_once_confident() {
+        let batch_id = ImportBatchId::new();
+        let repository = InMemoryMatchingRepository::with_batch(batch_id.clone());
+        let initial_provider = FakeMusicBrainzProvider::with_release_candidates(vec![
+            MusicBrainzReleaseCandidate {
+                id: "release-strong".to_string(),
+                title: "Kid A".to_string(),
+                score: 96,
+                artist_names: vec!["Radiohead".to_string()],
+                release_group_id: Some("group-1".to_string()),
+                release_group_title: Some("Kid A".to_string()),
+                country: Some("GB".to_string()),
+                date: Some("2000-10-02".to_string()),
+                track_count: Some(1),
+            },
+            MusicBrainzReleaseCandidate {
+                id: "release-near".to_string(),
+                title: "Kid A".to_string(),
+                score: 94,
+                artist_names: vec!["Radiohead".to_string()],
+                release_group_id: Some("group-2".to_string()),
+                release_group_title: Some("Kid A".to_string()),
+                country: Some("GB".to_string()),
+                date: Some("2000-10-03".to_string()),
+                track_count: Some(1),
+            },
+        ]);
+        ReleaseMatchingService::new(repository.clone(), initial_provider)
+            .score_and_persist_batch_matches(&batch_id, 100)
+            .await
+            .expect("initial ambiguous scoring should succeed");
+
+        let strong_provider = FakeMusicBrainzProvider::default();
+        let report = ReleaseMatchingService::new(repository.clone(), strong_provider)
+            .score_and_persist_batch_matches(&batch_id, 120)
+            .await
+            .expect("rescoring should succeed");
+
+        let ambiguous_issues = repository.issues_for(
+            IssueSubject::ReleaseInstance(report.groups[0].release_instance.id.clone()),
+            IssueType::AmbiguousReleaseMatch,
+        );
+        assert_eq!(ambiguous_issues.len(), 1);
+        assert_eq!(ambiguous_issues[0].state, IssueState::Resolved);
     }
 
     #[tokio::test]
@@ -1720,6 +1979,7 @@ mod tests {
         release_instances: Arc<Mutex<Vec<ReleaseInstance>>>,
         candidate_matches: Arc<Mutex<HashMap<ReleaseInstanceId, Vec<CandidateMatch>>>>,
         metadata_snapshots: Arc<Mutex<Vec<MetadataSnapshot>>>,
+        issues: Arc<Mutex<Vec<Issue>>>,
     }
 
     impl InMemoryMatchingRepository {
@@ -1795,6 +2055,7 @@ mod tests {
                 release_instances: Arc::new(Mutex::new(Vec::new())),
                 candidate_matches: Arc::new(Mutex::new(HashMap::new())),
                 metadata_snapshots: Arc::new(Mutex::new(Vec::new())),
+                issues: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1823,6 +2084,16 @@ mod tests {
                         MetadataSubject::ReleaseInstance(ref id) if id == release_instance_id
                     )
                 })
+                .cloned()
+                .collect()
+        }
+
+        fn issues_for(&self, subject: IssueSubject, issue_type: IssueType) -> Vec<Issue> {
+            self.issues
+                .lock()
+                .expect("issues should lock")
+                .iter()
+                .filter(|issue| issue.subject == subject && issue.issue_type == issue_type)
                 .cloned()
                 .collect()
         }
@@ -1922,10 +2193,28 @@ mod tests {
 
         fn list_candidate_matches(
             &self,
-            _release_instance_id: &ReleaseInstanceId,
-            _page: &crate::support::pagination::PageRequest,
-        ) -> Result<crate::support::pagination::Page<CandidateMatch>, RepositoryError> {
-            unimplemented!("not needed in matching tests")
+            release_instance_id: &ReleaseInstanceId,
+            page: &PageRequest,
+        ) -> Result<Page<CandidateMatch>, RepositoryError> {
+            let items = self
+                .candidate_matches
+                .lock()
+                .expect("candidate matches should lock")
+                .get(release_instance_id)
+                .cloned()
+                .unwrap_or_default();
+            let total = items.len() as u64;
+            let offset = (page.offset as usize).min(items.len());
+            let paged = items
+                .into_iter()
+                .skip(offset)
+                .take(page.limit as usize)
+                .collect();
+            Ok(Page {
+                items: paged,
+                request: *page,
+                total,
+            })
         }
 
         fn get_candidate_match(
@@ -2008,6 +2297,82 @@ mod tests {
                 .lock()
                 .expect("metadata snapshots should lock")
                 .extend_from_slice(snapshots);
+            Ok(())
+        }
+    }
+
+    impl IssueRepository for InMemoryMatchingRepository {
+        fn get_issue(
+            &self,
+            id: &crate::support::ids::IssueId,
+        ) -> Result<Option<Issue>, RepositoryError> {
+            Ok(self
+                .issues
+                .lock()
+                .expect("issues should lock")
+                .iter()
+                .find(|issue| issue.id == *id)
+                .cloned())
+        }
+
+        fn list_issues(&self, query: &IssueListQuery) -> Result<Page<Issue>, RepositoryError> {
+            let mut items = self
+                .issues
+                .lock()
+                .expect("issues should lock")
+                .iter()
+                .filter(|issue| {
+                    query
+                        .state
+                        .as_ref()
+                        .is_none_or(|state| &issue.state == state)
+                        && query
+                            .issue_type
+                            .as_ref()
+                            .is_none_or(|issue_type| &issue.issue_type == issue_type)
+                        && query
+                            .subject
+                            .as_ref()
+                            .is_none_or(|subject| &issue.subject == subject)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            items.sort_by(|left, right| {
+                right
+                    .created_at_unix_seconds
+                    .cmp(&left.created_at_unix_seconds)
+            });
+            let total = items.len() as u64;
+            let offset = (query.page.offset as usize).min(items.len());
+            let paged = items
+                .into_iter()
+                .skip(offset)
+                .take(query.page.limit as usize)
+                .collect();
+            Ok(Page {
+                items: paged,
+                request: query.page,
+                total,
+            })
+        }
+    }
+
+    impl IssueCommandRepository for InMemoryMatchingRepository {
+        fn create_issue(&self, issue: &Issue) -> Result<(), RepositoryError> {
+            self.issues
+                .lock()
+                .expect("issues should lock")
+                .push(issue.clone());
+            Ok(())
+        }
+
+        fn update_issue(&self, issue: &Issue) -> Result<(), RepositoryError> {
+            let mut issues = self.issues.lock().expect("issues should lock");
+            let existing = issues
+                .iter_mut()
+                .find(|existing| existing.id == issue.id)
+                .expect("issue should exist");
+            *existing = issue.clone();
             Ok(())
         }
     }
