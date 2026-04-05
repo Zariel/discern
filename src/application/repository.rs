@@ -97,6 +97,14 @@ pub trait JobRepository {
     fn list_jobs(&self, query: &JobListQuery) -> Result<Page<Job>, RepositoryError>;
 }
 
+pub trait JobCommandRepository {
+    fn create_job(&self, job: &Job) -> Result<(), RepositoryError>;
+
+    fn update_job(&self, job: &Job) -> Result<(), RepositoryError>;
+
+    fn list_recoverable_jobs(&self) -> Result<Vec<Job>, RepositoryError>;
+}
+
 pub trait ExportRepository {
     fn get_latest_exported_metadata(
         &self,

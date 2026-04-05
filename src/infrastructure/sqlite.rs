@@ -8,9 +8,9 @@ use serde_json::Value;
 
 use crate::application::repository::{
     ExportRepository, ExportedMetadataListQuery, ImportBatchListQuery, ImportBatchRepository,
-    IssueCommandRepository, IssueListQuery, IssueRepository, JobListQuery, JobRepository,
-    ReleaseGroupSearchQuery, ReleaseInstanceListQuery, ReleaseInstanceRepository, ReleaseListQuery,
-    ReleaseRepository, RepositoryError, RepositoryErrorKind,
+    IssueCommandRepository, IssueListQuery, IssueRepository, JobCommandRepository, JobListQuery,
+    JobRepository, ReleaseGroupSearchQuery, ReleaseInstanceListQuery, ReleaseInstanceRepository,
+    ReleaseListQuery, ReleaseRepository, RepositoryError, RepositoryErrorKind,
 };
 use crate::domain::candidate_match::{
     CandidateMatch, CandidateProvider, CandidateScore, CandidateSubject, EvidenceKind,
@@ -686,6 +686,100 @@ impl JobRepository for SqliteRepositories {
             request: query.page,
             total: total as u64,
         })
+    }
+}
+
+impl JobCommandRepository for SqliteRepositories {
+    fn create_job(&self, job: &Job) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO jobs
+                     (id, job_type, subject_kind, subject_id, status, progress_phase,
+                      retry_count, triggered_by, created_at_unix_seconds,
+                      started_at_unix_seconds, finished_at_unix_seconds, error_payload)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        job.id.as_uuid().to_string(),
+                        job_type_to_sql(&job.job_type),
+                        job_subject_kind_to_sql(&job.subject),
+                        job_subject_id_to_sql(&job.subject),
+                        job_status_to_sql(&job.status),
+                        &job.progress_phase,
+                        i64::from(job.retry_count),
+                        job_trigger_to_sql(&job.triggered_by),
+                        job.created_at_unix_seconds,
+                        job.started_at_unix_seconds,
+                        job.finished_at_unix_seconds,
+                        &job.error_payload,
+                    ],
+                )
+                .map_err(to_storage_error)?;
+            Ok(())
+        })
+    }
+
+    fn update_job(&self, job: &Job) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            let changed = transaction
+                .execute(
+                    "UPDATE jobs
+                     SET job_type = ?2,
+                         subject_kind = ?3,
+                         subject_id = ?4,
+                         status = ?5,
+                         progress_phase = ?6,
+                         retry_count = ?7,
+                         triggered_by = ?8,
+                         created_at_unix_seconds = ?9,
+                         started_at_unix_seconds = ?10,
+                         finished_at_unix_seconds = ?11,
+                         error_payload = ?12
+                     WHERE id = ?1",
+                    params![
+                        job.id.as_uuid().to_string(),
+                        job_type_to_sql(&job.job_type),
+                        job_subject_kind_to_sql(&job.subject),
+                        job_subject_id_to_sql(&job.subject),
+                        job_status_to_sql(&job.status),
+                        &job.progress_phase,
+                        i64::from(job.retry_count),
+                        job_trigger_to_sql(&job.triggered_by),
+                        job.created_at_unix_seconds,
+                        job.started_at_unix_seconds,
+                        job.finished_at_unix_seconds,
+                        &job.error_payload,
+                    ],
+                )
+                .map_err(to_storage_error)?;
+            if changed == 0 {
+                return Err(RepositoryError {
+                    kind: RepositoryErrorKind::NotFound,
+                    message: format!("job {} was not found", job.id.as_uuid()),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    fn list_recoverable_jobs(&self) -> Result<Vec<Job>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, job_type, subject_kind, subject_id, status,
+                        progress_phase, retry_count, triggered_by,
+                        created_at_unix_seconds, started_at_unix_seconds,
+                        finished_at_unix_seconds, error_payload
+                 FROM jobs
+                 WHERE status IN ('queued', 'running')
+                 ORDER BY created_at_unix_seconds ASC",
+            )
+            .map_err(to_storage_error)?;
+        statement
+            .query_map([], map_job)
+            .map_err(to_storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_storage_error)
     }
 }
 
@@ -1389,10 +1483,33 @@ fn parse_job_subject(kind: String, id: String) -> Result<JobSubject, String> {
     }
 }
 
+fn job_subject_kind_to_sql(subject: &JobSubject) -> &'static str {
+    match subject {
+        JobSubject::ImportBatch(_) => "import_batch",
+        JobSubject::ReleaseInstance(_) => "release_instance",
+        JobSubject::SourceScan(_) => "source_scan",
+    }
+}
+
+fn job_subject_id_to_sql(subject: &JobSubject) -> String {
+    match subject {
+        JobSubject::ImportBatch(id) => id.as_uuid().to_string(),
+        JobSubject::ReleaseInstance(id) => id.as_uuid().to_string(),
+        JobSubject::SourceScan(source) => source.clone(),
+    }
+}
+
 fn parse_job_trigger(value: String) -> JobTrigger {
     match value.as_str() {
         "system" => JobTrigger::System,
         _ => JobTrigger::Operator,
+    }
+}
+
+fn job_trigger_to_sql(trigger: &JobTrigger) -> &'static str {
+    match trigger {
+        JobTrigger::System => "system",
+        JobTrigger::Operator => "operator",
     }
 }
 
@@ -1453,11 +1570,11 @@ impl std::error::Error for SimpleError {}
 mod tests {
     use super::*;
     use crate::application::repository::{
-        ExportRepository, IssueRepository, JobRepository, ReleaseInstanceRepository,
-        ReleaseRepository,
+        ExportRepository, IssueRepository, JobCommandRepository, JobRepository,
+        ReleaseInstanceRepository, ReleaseRepository,
     };
     use crate::domain::issue::IssueState;
-    use crate::domain::job::JobStatus;
+    use crate::domain::job::{JobStatus, JobSubject, JobTrigger, JobType};
     use crate::domain::release_instance::{FormatFamily, ReleaseInstanceState};
     use uuid::Uuid;
 
@@ -1668,6 +1785,35 @@ mod tests {
             batch.received_paths,
             vec![PathBuf::from("/incoming/radiohead")]
         );
+    }
+
+    #[test]
+    fn repositories_persist_job_queue_updates_and_recovery() {
+        let (context, _path) = seeded_context();
+        let repositories = SqliteRepositories::new(context);
+        let mut job = Job::queued(
+            JobType::AnalyzeReleaseInstance,
+            JobSubject::SourceScan("startup".to_string()),
+            JobTrigger::Operator,
+            300,
+        );
+
+        repositories
+            .create_job(&job)
+            .expect("job creation should succeed");
+        job.start("analyzing", 301)
+            .expect("queued jobs should start");
+        repositories
+            .update_job(&job)
+            .expect("job update should succeed");
+
+        let recoverable = repositories
+            .list_recoverable_jobs()
+            .expect("recovery query should succeed");
+        assert!(recoverable.iter().any(|candidate| candidate.id == job.id));
+        assert!(recoverable.iter().all(|candidate| {
+            matches!(candidate.status, JobStatus::Queued | JobStatus::Running)
+        }));
     }
 
     fn seeded_context() -> (SqliteRepositoryContext, PathBuf) {

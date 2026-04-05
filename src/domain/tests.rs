@@ -9,7 +9,7 @@ use crate::domain::exported_metadata_snapshot::{
 use crate::domain::file::{FileRecord, FileRole};
 use crate::domain::import_batch::{BatchRequester, ImportBatch, ImportBatchStatus, ImportMode};
 use crate::domain::issue::{Issue, IssueState, IssueSubject, IssueType};
-use crate::domain::job::{Job, JobStatus, JobSubject, JobTrigger, JobType};
+use crate::domain::job::{Job, JobStatus, JobSubject, JobTrigger, JobType, RetryScope};
 use crate::domain::manual_override::{ManualOverride, OverrideField, OverrideSubject};
 use crate::domain::release::{Release, ReleaseEdition};
 use crate::domain::release_artwork::{ArtworkSource, ReleaseArtwork};
@@ -317,4 +317,30 @@ fn candidate_matches_attach_to_release_instance_with_scored_evidence() {
     ));
     assert_eq!(candidate.evidence_matches.len(), 2);
     assert_eq!(candidate.mismatches.len(), 1);
+}
+
+#[test]
+fn jobs_follow_queue_and_retry_lifecycle() {
+    let release_instance_id = ReleaseInstanceId::new();
+    let mut job = Job::queued(
+        JobType::MatchReleaseInstance,
+        JobSubject::ReleaseInstance(release_instance_id),
+        JobTrigger::System,
+        1_712_288_600,
+    );
+
+    job.start("matching", 1_712_288_601)
+        .expect("queued jobs should start");
+    assert_eq!(job.status, JobStatus::Running);
+
+    job.fail("matching", "rate limited", 1_712_288_602)
+        .expect("running jobs should fail");
+    assert_eq!(job.status, JobStatus::Failed);
+    assert_eq!(job.error_payload, Some("rate limited".to_string()));
+
+    job.retry(RetryScope::Rematch, 1_712_288_603)
+        .expect("failed jobs should retry");
+    assert_eq!(job.status, JobStatus::Queued);
+    assert_eq!(job.progress_phase, "rematch".to_string());
+    assert_eq!(job.retry_count, 1);
 }
