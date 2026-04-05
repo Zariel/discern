@@ -1,12 +1,15 @@
 use crate::domain::candidate_match::CandidateMatch;
 use crate::domain::exported_metadata_snapshot::ExportedMetadataSnapshot;
 use crate::domain::import_batch::ImportBatch;
+use crate::domain::ingest_evidence::IngestEvidenceRecord;
 use crate::domain::issue::{Issue, IssueState, IssueType};
 use crate::domain::job::{Job, JobStatus, JobType};
+use crate::domain::metadata_snapshot::MetadataSnapshot;
 use crate::domain::release::Release;
 use crate::domain::release_group::ReleaseGroup;
 use crate::domain::release_instance::{FormatFamily, ReleaseInstance, ReleaseInstanceState};
 use crate::domain::source::{Source, SourceLocator};
+use crate::domain::staging_manifest::StagingManifest;
 use crate::support::ids::{
     CandidateMatchId, ExportedMetadataSnapshotId, ImportBatchId, IssueId, JobId, ReleaseGroupId,
     ReleaseId, ReleaseInstanceId,
@@ -81,6 +84,11 @@ pub trait ImportBatchRepository {
 }
 
 pub trait SourceRepository {
+    fn get_source(
+        &self,
+        id: &crate::support::ids::SourceId,
+    ) -> Result<Option<Source>, RepositoryError>;
+
     fn find_source_by_locator(
         &self,
         locator: &SourceLocator,
@@ -94,10 +102,51 @@ pub trait SourceCommandRepository {
 pub trait ImportBatchCommandRepository {
     fn create_import_batch(&self, batch: &ImportBatch) -> Result<(), RepositoryError>;
 
+    fn update_import_batch(&self, batch: &ImportBatch) -> Result<(), RepositoryError>;
+
     fn list_active_import_batches_for_source(
         &self,
         source_id: &crate::support::ids::SourceId,
     ) -> Result<Vec<ImportBatch>, RepositoryError>;
+}
+
+pub trait StagingManifestRepository {
+    fn list_staging_manifests_for_batch(
+        &self,
+        batch_id: &ImportBatchId,
+    ) -> Result<Vec<StagingManifest>, RepositoryError>;
+}
+
+pub trait StagingManifestCommandRepository {
+    fn create_staging_manifest(&self, manifest: &StagingManifest) -> Result<(), RepositoryError>;
+}
+
+pub trait IngestEvidenceRepository {
+    fn list_ingest_evidence_for_batch(
+        &self,
+        batch_id: &ImportBatchId,
+    ) -> Result<Vec<IngestEvidenceRecord>, RepositoryError>;
+}
+
+pub trait IngestEvidenceCommandRepository {
+    fn create_ingest_evidence_records(
+        &self,
+        records: &[IngestEvidenceRecord],
+    ) -> Result<(), RepositoryError>;
+}
+
+pub trait MetadataSnapshotRepository {
+    fn list_metadata_snapshots_for_batch(
+        &self,
+        batch_id: &ImportBatchId,
+    ) -> Result<Vec<MetadataSnapshot>, RepositoryError>;
+}
+
+pub trait MetadataSnapshotCommandRepository {
+    fn create_metadata_snapshots(
+        &self,
+        snapshots: &[MetadataSnapshot],
+    ) -> Result<(), RepositoryError>;
 }
 
 pub trait IssueRepository {

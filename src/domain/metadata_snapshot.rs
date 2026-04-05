@@ -1,4 +1,4 @@
-use crate::support::ids::{FileId, MetadataSnapshotId, ReleaseInstanceId};
+use crate::support::ids::{FileId, ImportBatchId, MetadataSnapshotId, ReleaseInstanceId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataSnapshot {
@@ -12,6 +12,7 @@ pub struct MetadataSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataSubject {
+    ImportBatch(ImportBatchId),
     ReleaseInstance(ReleaseInstanceId),
     File(FileId),
 }

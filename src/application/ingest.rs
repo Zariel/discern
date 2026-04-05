@@ -3,12 +3,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use id3::TagLike;
+use serde_json::json;
 use serde_yaml::Value as YamlValue;
 
 use crate::application::config::{ValidatedRuntimeConfig, WatchDirectoryPolicy};
 use crate::application::repository::{
-    ImportBatchCommandRepository, JobCommandRepository, RepositoryError, RepositoryErrorKind,
-    SourceCommandRepository, SourceRepository,
+    ImportBatchCommandRepository, ImportBatchRepository, IngestEvidenceCommandRepository,
+    JobCommandRepository, MetadataSnapshotCommandRepository, RepositoryError, RepositoryErrorKind,
+    SourceCommandRepository, SourceRepository, StagingManifestCommandRepository,
 };
 use crate::domain::import_batch::{BatchRequester, ImportBatch, ImportBatchStatus};
 use crate::domain::ingest_evidence::{
@@ -16,9 +18,13 @@ use crate::domain::ingest_evidence::{
     ObservedValueKind,
 };
 use crate::domain::job::{Job, JobSubject, JobTrigger, JobType};
+use crate::domain::metadata_snapshot::{
+    MetadataSnapshot, MetadataSnapshotSource, MetadataSubject, SnapshotFormat,
+};
 use crate::domain::source::{Source, SourceKind, SourceLocator};
 use crate::domain::staging_manifest::{
-    AuxiliaryFile, AuxiliaryFileRole, GroupingDecision, GroupingStrategy, StagedReleaseGroup,
+    AuxiliaryFile, AuxiliaryFileRole, FileFingerprint, GroupingDecision, GroupingStrategy,
+    ObservedTag, StagedFile, StagedReleaseGroup, StagingManifest, StagingManifestSource,
 };
 use crate::support::ids::ImportBatchId;
 
@@ -48,6 +54,14 @@ pub struct IngestSubmissionReport {
     pub source: Source,
     pub batch: ImportBatch,
     pub job: Job,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchAnalysisReport {
+    pub batch: ImportBatch,
+    pub manifest: StagingManifest,
+    pub evidence_records: Vec<IngestEvidenceRecord>,
+    pub metadata_snapshots: Vec<MetadataSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +291,279 @@ where
             .create_job(&job)
             .map_err(map_repository_error)?;
         Ok(job)
+    }
+}
+
+fn build_staging_manifest(
+    batch: &ImportBatch,
+    source: &Source,
+    grouped: &GroupedReleaseInputs,
+    evidence_records: &[IngestEvidenceRecord],
+    captured_at_unix_seconds: i64,
+) -> Result<StagingManifest, WatchDiscoveryError> {
+    let mut discovered_files = Vec::new();
+
+    for group in &grouped.decision.groups {
+        for file_path in &group.file_paths {
+            discovered_files.push(build_staged_file(file_path, evidence_records)?);
+        }
+    }
+
+    discovered_files.sort_by(|left, right| left.path.cmp(&right.path));
+
+    Ok(StagingManifest {
+        id: crate::support::ids::StagingManifestId::new(),
+        batch_id: batch.id.clone(),
+        source: StagingManifestSource {
+            kind: source.kind.clone(),
+            source_path: manifest_source_path(source, batch),
+        },
+        discovered_files,
+        auxiliary_files: grouped.auxiliary_files.clone(),
+        grouping: grouped.decision.clone(),
+        captured_at_unix_seconds,
+    })
+}
+
+fn build_staged_file(
+    file_path: &Path,
+    evidence_records: &[IngestEvidenceRecord],
+) -> Result<StagedFile, WatchDiscoveryError> {
+    let normalized_path = normalize_path(file_path);
+    let evidence = evidence_records
+        .iter()
+        .find(|record| {
+            matches!(
+                &record.subject,
+                IngestEvidenceSubject::DiscoveredPath(path) if path == &normalized_path
+            )
+        })
+        .ok_or_else(|| WatchDiscoveryError {
+            kind: WatchDiscoveryErrorKind::Conflict,
+            message: format!(
+                "missing embedded-tag evidence for {}",
+                normalized_path.display()
+            ),
+        })?;
+    let metadata = fs::metadata(file_path).map_err(|error| WatchDiscoveryError {
+        kind: if error.kind() == std::io::ErrorKind::NotFound {
+            WatchDiscoveryErrorKind::NotFound
+        } else {
+            WatchDiscoveryErrorKind::Io
+        },
+        message: format!("failed to inspect {}: {error}", file_path.display()),
+    })?;
+
+    Ok(StagedFile {
+        path: normalized_path,
+        fingerprint: FileFingerprint::LightweightFingerprint(format!(
+            "{}:{}",
+            metadata.len(),
+            metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_secs())
+                .unwrap_or_default()
+        )),
+        observed_tags: evidence
+            .observations
+            .iter()
+            .map(|observation| ObservedTag {
+                key: observed_value_kind_key(&observation.kind).to_string(),
+                value: observation.value.clone(),
+            })
+            .collect(),
+        duration_ms: evidence
+            .observations
+            .iter()
+            .find(|observation| observation.kind == ObservedValueKind::DurationMs)
+            .and_then(|observation| observation.value.parse().ok()),
+        format_family: infer_format_family(file_path).ok_or_else(|| WatchDiscoveryError {
+            kind: WatchDiscoveryErrorKind::Conflict,
+            message: format!("unsupported audio format for {}", file_path.display()),
+        })?,
+    })
+}
+
+fn build_metadata_snapshots(
+    batch_id: &ImportBatchId,
+    evidence_records: &[IngestEvidenceRecord],
+    captured_at_unix_seconds: i64,
+) -> Result<Vec<MetadataSnapshot>, WatchDiscoveryError> {
+    let mut snapshots = Vec::new();
+
+    for record in evidence_records {
+        let source = match ingest_evidence_source_to_metadata_source(&record.source) {
+            Some(source) => source,
+            None => continue,
+        };
+        let (format, payload) = match &record.structured_payload {
+            Some(payload) => (
+                snapshot_format_for_evidence_source(&record.source),
+                payload.clone(),
+            ),
+            None => (
+                SnapshotFormat::Json,
+                serde_json::to_string(&json!({
+                    "subject": format_ingest_evidence_subject(&record.subject),
+                    "observations": record
+                        .observations
+                        .iter()
+                        .map(|observation| {
+                            json!({
+                                "kind": observed_value_kind_key(&observation.kind),
+                                "value": observation.value,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                }))
+                .map_err(|error| WatchDiscoveryError {
+                    kind: WatchDiscoveryErrorKind::Conflict,
+                    message: format!("failed to serialize metadata snapshot: {error}"),
+                })?,
+            ),
+        };
+        snapshots.push(MetadataSnapshot {
+            id: crate::support::ids::MetadataSnapshotId::new(),
+            subject: MetadataSubject::ImportBatch(batch_id.clone()),
+            source,
+            format,
+            payload,
+            captured_at_unix_seconds,
+        });
+    }
+
+    Ok(snapshots)
+}
+
+fn manifest_source_path(source: &Source, batch: &ImportBatch) -> PathBuf {
+    match &source.locator {
+        SourceLocator::FilesystemPath(path) => normalize_path(path),
+        SourceLocator::ManualEntry { submitted_path } => normalize_path(submitted_path),
+        SourceLocator::ApiClient { .. } | SourceLocator::TrackerRef { .. } => batch
+            .received_paths
+            .first()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from(".")),
+    }
+}
+
+fn ingest_evidence_source_to_metadata_source(
+    source: &IngestEvidenceSource,
+) -> Option<MetadataSnapshotSource> {
+    match source {
+        IngestEvidenceSource::EmbeddedTags => Some(MetadataSnapshotSource::EmbeddedTags),
+        IngestEvidenceSource::FileName => Some(MetadataSnapshotSource::FileNameHeuristics),
+        IngestEvidenceSource::DirectoryStructure => {
+            Some(MetadataSnapshotSource::DirectoryStructure)
+        }
+        IngestEvidenceSource::GazelleYaml => Some(MetadataSnapshotSource::GazelleYaml),
+        IngestEvidenceSource::AuxiliaryFile => None,
+    }
+}
+
+fn snapshot_format_for_evidence_source(source: &IngestEvidenceSource) -> SnapshotFormat {
+    match source {
+        IngestEvidenceSource::GazelleYaml => SnapshotFormat::Yaml,
+        _ => SnapshotFormat::Json,
+    }
+}
+
+fn format_ingest_evidence_subject(subject: &IngestEvidenceSubject) -> serde_json::Value {
+    match subject {
+        IngestEvidenceSubject::DiscoveredPath(path) => json!({
+            "kind": "discovered_path",
+            "value": path.to_string_lossy(),
+        }),
+        IngestEvidenceSubject::GroupedReleaseInput { group_key } => json!({
+            "kind": "grouped_release_input",
+            "value": group_key,
+        }),
+    }
+}
+
+fn observed_value_kind_key(kind: &ObservedValueKind) -> &'static str {
+    match kind {
+        ObservedValueKind::Artist => "artist",
+        ObservedValueKind::ReleaseTitle => "release_title",
+        ObservedValueKind::ReleaseYear => "release_year",
+        ObservedValueKind::TrackTitle => "track_title",
+        ObservedValueKind::TrackNumber => "track_number",
+        ObservedValueKind::DiscNumber => "disc_number",
+        ObservedValueKind::DurationMs => "duration_ms",
+        ObservedValueKind::FormatFamily => "format_family",
+        ObservedValueKind::MediaDescriptor => "media_descriptor",
+        ObservedValueKind::SourceDescriptor => "source_descriptor",
+        ObservedValueKind::TrackerIdentifier => "tracker_identifier",
+    }
+}
+
+impl<R> WatchDiscoveryService<R>
+where
+    R: SourceRepository
+        + ImportBatchRepository
+        + ImportBatchCommandRepository
+        + StagingManifestCommandRepository
+        + IngestEvidenceCommandRepository
+        + MetadataSnapshotCommandRepository,
+{
+    pub fn analyze_import_batch(
+        &self,
+        batch_id: &ImportBatchId,
+        captured_at_unix_seconds: i64,
+    ) -> Result<BatchAnalysisReport, WatchDiscoveryError> {
+        let batch = self
+            .repository
+            .get_import_batch(batch_id)
+            .map_err(map_repository_error)?
+            .ok_or_else(|| WatchDiscoveryError {
+                kind: WatchDiscoveryErrorKind::NotFound,
+                message: format!("import batch {} was not found", batch_id.as_uuid()),
+            })?;
+        let source = self
+            .repository
+            .get_source(&batch.source_id)
+            .map_err(map_repository_error)?
+            .ok_or_else(|| WatchDiscoveryError {
+                kind: WatchDiscoveryErrorKind::NotFound,
+                message: format!("source {} was not found", batch.source_id.as_uuid()),
+            })?;
+        let grouped =
+            group_release_inputs(&batch.received_paths, &self.config.import.supported_formats)?;
+        let evidence = extract_group_evidence(batch_id, &grouped, captured_at_unix_seconds)?;
+        let manifest = build_staging_manifest(
+            &batch,
+            &source,
+            &grouped,
+            &evidence.records,
+            captured_at_unix_seconds,
+        )?;
+        let metadata_snapshots =
+            build_metadata_snapshots(batch_id, &evidence.records, captured_at_unix_seconds)?;
+
+        self.repository
+            .create_staging_manifest(&manifest)
+            .map_err(map_repository_error)?;
+        self.repository
+            .create_ingest_evidence_records(&evidence.records)
+            .map_err(map_repository_error)?;
+        self.repository
+            .create_metadata_snapshots(&metadata_snapshots)
+            .map_err(map_repository_error)?;
+
+        let mut updated_batch = batch.clone();
+        updated_batch.status = ImportBatchStatus::Grouped;
+        self.repository
+            .update_import_batch(&updated_batch)
+            .map_err(map_repository_error)?;
+
+        Ok(BatchAnalysisReport {
+            batch: updated_batch,
+            manifest,
+            evidence_records: evidence.records,
+            metadata_snapshots,
+        })
     }
 }
 
@@ -1169,14 +1456,77 @@ mod tests {
         cleanup_root(temp_root);
     }
 
+    #[test]
+    fn service_persists_batch_analysis_output() {
+        let temp_root = test_root("analyze-batch");
+        let album_path = temp_root.join("Kid A");
+        fs::create_dir_all(&album_path).expect("album directory should be created");
+        let mp3_path = album_path.join("01 Everything.mp3");
+        fs::write(&mp3_path, b"").expect("mp3 placeholder should exist");
+
+        let mut tag = id3::Tag::new();
+        tag.set_artist("Radiohead");
+        tag.set_album("Kid A");
+        tag.set_title("Everything in Its Right Place");
+        tag.set_track(1);
+        tag.write_to_path(&mp3_path, id3::Version::Id3v24)
+            .expect("id3 tag should be written");
+
+        let yaml_path = album_path.join("release.yaml");
+        fs::write(
+            &yaml_path,
+            "release_name: Kid A\nartist: Radiohead\nyear: 2000\n",
+        )
+        .expect("yaml should be written");
+
+        let repository = InMemoryIngestRepository::default();
+        let config =
+            ValidatedRuntimeConfig::from_validated_app_config(&crate::config::AppConfig::default());
+        let service = WatchDiscoveryService::new(repository.clone(), config);
+
+        let submission = service
+            .submit_manual_path("chris", album_path.clone(), 500)
+            .expect("manual intake should succeed");
+        let report = service
+            .analyze_import_batch(&submission.batch.id, 501)
+            .expect("batch analysis should succeed");
+
+        assert_eq!(report.batch.status, ImportBatchStatus::Grouped);
+        assert_eq!(report.manifest.discovered_files.len(), 1);
+        assert_eq!(report.manifest.auxiliary_files.len(), 1);
+        assert_eq!(report.evidence_records.len(), 2);
+        assert_eq!(report.metadata_snapshots.len(), 2);
+        assert!(report.metadata_snapshots.iter().any(|snapshot| {
+            snapshot.source == MetadataSnapshotSource::GazelleYaml
+                && snapshot.format == SnapshotFormat::Yaml
+        }));
+
+        cleanup_root(temp_root);
+    }
+
     #[derive(Clone, Default)]
     struct InMemoryIngestRepository {
         sources: Arc<Mutex<HashMap<String, Source>>>,
         batches: Arc<Mutex<HashMap<String, ImportBatch>>>,
         jobs: Arc<Mutex<HashMap<String, Job>>>,
+        manifests: Arc<Mutex<Vec<StagingManifest>>>,
+        evidence_records: Arc<Mutex<Vec<IngestEvidenceRecord>>>,
+        metadata_snapshots: Arc<Mutex<Vec<MetadataSnapshot>>>,
     }
 
     impl SourceRepository for InMemoryIngestRepository {
+        fn get_source(
+            &self,
+            id: &crate::support::ids::SourceId,
+        ) -> Result<Option<Source>, RepositoryError> {
+            Ok(self
+                .sources
+                .lock()
+                .expect("repository should lock")
+                .get(&id.as_uuid().to_string())
+                .cloned())
+        }
+
         fn find_source_by_locator(
             &self,
             locator: &SourceLocator,
@@ -1203,6 +1553,14 @@ mod tests {
 
     impl ImportBatchCommandRepository for InMemoryIngestRepository {
         fn create_import_batch(&self, batch: &ImportBatch) -> Result<(), RepositoryError> {
+            self.batches
+                .lock()
+                .expect("repository should lock")
+                .insert(batch.id.as_uuid().to_string(), batch.clone());
+            Ok(())
+        }
+
+        fn update_import_batch(&self, batch: &ImportBatch) -> Result<(), RepositoryError> {
             self.batches
                 .lock()
                 .expect("repository should lock")
@@ -1296,6 +1654,45 @@ mod tests {
 
         fn list_recoverable_jobs(&self) -> Result<Vec<Job>, RepositoryError> {
             Ok(Vec::new())
+        }
+    }
+
+    impl StagingManifestCommandRepository for InMemoryIngestRepository {
+        fn create_staging_manifest(
+            &self,
+            manifest: &StagingManifest,
+        ) -> Result<(), RepositoryError> {
+            self.manifests
+                .lock()
+                .expect("repository should lock")
+                .push(manifest.clone());
+            Ok(())
+        }
+    }
+
+    impl IngestEvidenceCommandRepository for InMemoryIngestRepository {
+        fn create_ingest_evidence_records(
+            &self,
+            records: &[IngestEvidenceRecord],
+        ) -> Result<(), RepositoryError> {
+            self.evidence_records
+                .lock()
+                .expect("repository should lock")
+                .extend(records.iter().cloned());
+            Ok(())
+        }
+    }
+
+    impl MetadataSnapshotCommandRepository for InMemoryIngestRepository {
+        fn create_metadata_snapshots(
+            &self,
+            snapshots: &[MetadataSnapshot],
+        ) -> Result<(), RepositoryError> {
+            self.metadata_snapshots
+                .lock()
+                .expect("repository should lock")
+                .extend(snapshots.iter().cloned());
+            Ok(())
         }
     }
 

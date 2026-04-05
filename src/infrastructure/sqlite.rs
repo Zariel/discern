@@ -4,14 +4,17 @@ use std::time::Duration;
 
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::application::repository::{
     ExportRepository, ExportedMetadataListQuery, ImportBatchCommandRepository,
-    ImportBatchListQuery, ImportBatchRepository, IssueCommandRepository, IssueListQuery,
-    IssueRepository, JobCommandRepository, JobListQuery, JobRepository, ReleaseGroupSearchQuery,
-    ReleaseInstanceListQuery, ReleaseInstanceRepository, ReleaseListQuery, ReleaseRepository,
-    RepositoryError, RepositoryErrorKind, SourceCommandRepository, SourceRepository,
+    ImportBatchListQuery, ImportBatchRepository, IngestEvidenceCommandRepository,
+    IngestEvidenceRepository, IssueCommandRepository, IssueListQuery, IssueRepository,
+    JobCommandRepository, JobListQuery, JobRepository, MetadataSnapshotCommandRepository,
+    MetadataSnapshotRepository, ReleaseGroupSearchQuery, ReleaseInstanceListQuery,
+    ReleaseInstanceRepository, ReleaseListQuery, ReleaseRepository, RepositoryError,
+    RepositoryErrorKind, SourceCommandRepository, SourceRepository,
+    StagingManifestCommandRepository, StagingManifestRepository,
 };
 use crate::domain::candidate_match::{
     CandidateMatch, CandidateProvider, CandidateScore, CandidateSubject, EvidenceKind,
@@ -21,8 +24,15 @@ use crate::domain::exported_metadata_snapshot::{
     CompatibilityReport, ExportedMetadataSnapshot, QualifierVisibility,
 };
 use crate::domain::import_batch::{BatchRequester, ImportBatch, ImportBatchStatus, ImportMode};
+use crate::domain::ingest_evidence::{
+    IngestEvidenceRecord, IngestEvidenceSource, IngestEvidenceSubject, ObservedValue,
+    ObservedValueKind,
+};
 use crate::domain::issue::{Issue, IssueState, IssueSubject, IssueType};
 use crate::domain::job::{Job, JobStatus, JobSubject, JobTrigger, JobType};
+use crate::domain::metadata_snapshot::{
+    MetadataSnapshot, MetadataSnapshotSource, MetadataSubject, SnapshotFormat,
+};
 use crate::domain::release::{PartialDate, Release, ReleaseEdition};
 use crate::domain::release_group::{ReleaseGroup, ReleaseGroupKind};
 use crate::domain::release_instance::{
@@ -30,10 +40,15 @@ use crate::domain::release_instance::{
     ReleaseInstanceState, TechnicalVariant,
 };
 use crate::domain::source::{Source, SourceKind, SourceLocator};
+use crate::domain::staging_manifest::{
+    AuxiliaryFile, AuxiliaryFileRole, FileFingerprint, GroupingDecision, GroupingStrategy,
+    ObservedTag, StagedFile, StagedReleaseGroup, StagingManifest, StagingManifestSource,
+};
 use crate::support::ids::{
-    ArtistId, CandidateMatchId, DiscogsReleaseId, ExportedMetadataSnapshotId, ImportBatchId,
-    IssueId, JobId, MusicBrainzReleaseGroupId, MusicBrainzReleaseId, ReleaseGroupId, ReleaseId,
-    ReleaseInstanceId, SourceId, TrackInstanceId,
+    ArtistId, CandidateMatchId, DiscogsReleaseId, ExportedMetadataSnapshotId, FileId,
+    ImportBatchId, IngestEvidenceId, IssueId, JobId, MetadataSnapshotId, MusicBrainzReleaseGroupId,
+    MusicBrainzReleaseId, ReleaseGroupId, ReleaseId, ReleaseInstanceId, SourceId,
+    StagingManifestId, TrackInstanceId,
 };
 use crate::support::pagination::{Page, PageRequest};
 
@@ -490,6 +505,20 @@ impl ImportBatchRepository for SqliteRepositories {
 }
 
 impl SourceRepository for SqliteRepositories {
+    fn get_source(&self, id: &SourceId) -> Result<Option<Source>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        connection
+            .query_row(
+                "SELECT id, kind, display_name, locator_kind, locator_value, external_reference
+                 FROM sources
+                 WHERE id = ?1",
+                params![id.as_uuid().to_string()],
+                map_source,
+            )
+            .optional()
+            .map_err(to_storage_error)
+    }
+
     fn find_source_by_locator(
         &self,
         locator: &SourceLocator,
@@ -572,6 +601,56 @@ impl ImportBatchCommandRepository for SqliteRepositories {
         })
     }
 
+    fn update_import_batch(&self, batch: &ImportBatch) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "UPDATE import_batches
+                     SET source_id = ?2,
+                         mode = ?3,
+                         status = ?4,
+                         requested_by_kind = ?5,
+                         requested_by_name = ?6,
+                         created_at_unix_seconds = ?7
+                     WHERE id = ?1",
+                    params![
+                        batch.id.as_uuid().to_string(),
+                        batch.source_id.as_uuid().to_string(),
+                        import_mode_to_sql(&batch.mode),
+                        import_batch_status_to_sql(&batch.status),
+                        batch_requester_kind_to_sql(&batch.requested_by),
+                        batch_requester_name_to_sql(&batch.requested_by),
+                        batch.created_at_unix_seconds,
+                    ],
+                )
+                .map_err(to_storage_error)?;
+
+            transaction
+                .execute(
+                    "DELETE FROM import_batch_paths
+                     WHERE import_batch_id = ?1",
+                    params![batch.id.as_uuid().to_string()],
+                )
+                .map_err(to_storage_error)?;
+
+            for (ordinal, path) in batch.received_paths.iter().enumerate() {
+                transaction
+                    .execute(
+                        "INSERT INTO import_batch_paths (import_batch_id, ordinal, path)
+                         VALUES (?1, ?2, ?3)",
+                        params![
+                            batch.id.as_uuid().to_string(),
+                            ordinal as i64,
+                            path.to_string_lossy().to_string(),
+                        ],
+                    )
+                    .map_err(to_storage_error)?;
+            }
+
+            Ok(())
+        })
+    }
+
     fn list_active_import_batches_for_source(
         &self,
         source_id: &SourceId,
@@ -596,6 +675,177 @@ impl ImportBatchCommandRepository for SqliteRepositories {
             batch.received_paths = load_import_batch_paths(&connection, &batch.id)?;
         }
         Ok(items)
+    }
+}
+
+impl StagingManifestRepository for SqliteRepositories {
+    fn list_staging_manifests_for_batch(
+        &self,
+        batch_id: &ImportBatchId,
+    ) -> Result<Vec<StagingManifest>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, batch_id, source_kind, source_path, discovered_files_json,
+                        auxiliary_files_json, grouping_strategy, grouping_groups_json,
+                        grouping_notes_json, captured_at_unix_seconds
+                 FROM staging_manifests
+                 WHERE batch_id = ?1
+                 ORDER BY captured_at_unix_seconds DESC",
+            )
+            .map_err(to_storage_error)?;
+        statement
+            .query_map(
+                params![batch_id.as_uuid().to_string()],
+                map_staging_manifest,
+            )
+            .map_err(to_storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_storage_error)
+    }
+}
+
+impl StagingManifestCommandRepository for SqliteRepositories {
+    fn create_staging_manifest(&self, manifest: &StagingManifest) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO staging_manifests
+                     (id, batch_id, source_kind, source_path, discovered_files_json,
+                      auxiliary_files_json, grouping_strategy, grouping_groups_json,
+                      grouping_notes_json, captured_at_unix_seconds)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        manifest.id.as_uuid().to_string(),
+                        manifest.batch_id.as_uuid().to_string(),
+                        source_kind_to_sql(&manifest.source.kind),
+                        manifest.source.source_path.to_string_lossy().to_string(),
+                        serialize_staged_files(&manifest.discovered_files)?,
+                        serialize_auxiliary_files(&manifest.auxiliary_files)?,
+                        grouping_strategy_to_sql(&manifest.grouping.strategy),
+                        serialize_staged_release_groups(&manifest.grouping.groups)?,
+                        serialize_string_array(&manifest.grouping.notes)?,
+                        manifest.captured_at_unix_seconds,
+                    ],
+                )
+                .map_err(to_storage_error)?;
+            Ok(())
+        })
+    }
+}
+
+impl IngestEvidenceRepository for SqliteRepositories {
+    fn list_ingest_evidence_for_batch(
+        &self,
+        batch_id: &ImportBatchId,
+    ) -> Result<Vec<IngestEvidenceRecord>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, batch_id, subject_kind, subject_value, source,
+                        observations_json, structured_payload, captured_at_unix_seconds
+                 FROM ingest_evidence_records
+                 WHERE batch_id = ?1
+                 ORDER BY captured_at_unix_seconds DESC, id ASC",
+            )
+            .map_err(to_storage_error)?;
+        statement
+            .query_map(
+                params![batch_id.as_uuid().to_string()],
+                map_ingest_evidence_record,
+            )
+            .map_err(to_storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_storage_error)
+    }
+}
+
+impl IngestEvidenceCommandRepository for SqliteRepositories {
+    fn create_ingest_evidence_records(
+        &self,
+        records: &[IngestEvidenceRecord],
+    ) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            for record in records {
+                let (subject_kind, subject_value) = ingest_evidence_subject_to_sql(&record.subject);
+                transaction
+                    .execute(
+                        "INSERT INTO ingest_evidence_records
+                         (id, batch_id, subject_kind, subject_value, source,
+                          observations_json, structured_payload, captured_at_unix_seconds)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            record.id.as_uuid().to_string(),
+                            record.batch_id.as_uuid().to_string(),
+                            subject_kind,
+                            subject_value,
+                            ingest_evidence_source_to_sql(&record.source),
+                            serialize_observed_values(&record.observations)?,
+                            &record.structured_payload,
+                            record.captured_at_unix_seconds,
+                        ],
+                    )
+                    .map_err(to_storage_error)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl MetadataSnapshotRepository for SqliteRepositories {
+    fn list_metadata_snapshots_for_batch(
+        &self,
+        batch_id: &ImportBatchId,
+    ) -> Result<Vec<MetadataSnapshot>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, subject_kind, subject_id, source, format, payload,
+                        captured_at_unix_seconds
+                 FROM metadata_snapshots
+                 WHERE subject_kind = 'import_batch' AND subject_id = ?1
+                 ORDER BY captured_at_unix_seconds DESC, id ASC",
+            )
+            .map_err(to_storage_error)?;
+        statement
+            .query_map(
+                params![batch_id.as_uuid().to_string()],
+                map_metadata_snapshot,
+            )
+            .map_err(to_storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_storage_error)
+    }
+}
+
+impl MetadataSnapshotCommandRepository for SqliteRepositories {
+    fn create_metadata_snapshots(
+        &self,
+        snapshots: &[MetadataSnapshot],
+    ) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            for snapshot in snapshots {
+                let (subject_kind, subject_id) = metadata_subject_to_sql(&snapshot.subject);
+                transaction
+                    .execute(
+                        "INSERT INTO metadata_snapshots
+                         (id, subject_kind, subject_id, source, format, payload,
+                          captured_at_unix_seconds)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            snapshot.id.as_uuid().to_string(),
+                            subject_kind,
+                            subject_id,
+                            metadata_snapshot_source_to_sql(&snapshot.source),
+                            snapshot_format_to_sql(&snapshot.format),
+                            &snapshot.payload,
+                            snapshot.captured_at_unix_seconds,
+                        ],
+                    )
+                    .map_err(to_storage_error)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1121,6 +1371,54 @@ fn map_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
     })
 }
 
+fn map_staging_manifest(row: &rusqlite::Row<'_>) -> rusqlite::Result<StagingManifest> {
+    Ok(StagingManifest {
+        id: parse_uuid_id::<StagingManifestId>(row.get_ref(0)?, 0)?,
+        batch_id: parse_uuid_id::<ImportBatchId>(row.get_ref(1)?, 1)?,
+        source: StagingManifestSource {
+            kind: parse_source_kind(row.get(2)?),
+            source_path: PathBuf::from(row.get::<_, String>(3)?),
+        },
+        discovered_files: parse_staged_files(row.get(4)?)
+            .map_err(|error| invalid_column(4, error))?,
+        auxiliary_files: parse_auxiliary_files(row.get(5)?)
+            .map_err(|error| invalid_column(5, error))?,
+        grouping: GroupingDecision {
+            strategy: parse_grouping_strategy(row.get(6)?),
+            groups: parse_staged_release_groups(row.get(7)?)
+                .map_err(|error| invalid_column(7, error))?,
+            notes: parse_string_list(row.get(8)?).map_err(|error| invalid_column(8, error))?,
+        },
+        captured_at_unix_seconds: row.get(9)?,
+    })
+}
+
+fn map_ingest_evidence_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<IngestEvidenceRecord> {
+    Ok(IngestEvidenceRecord {
+        id: parse_uuid_id::<IngestEvidenceId>(row.get_ref(0)?, 0)?,
+        batch_id: parse_uuid_id::<ImportBatchId>(row.get_ref(1)?, 1)?,
+        subject: parse_ingest_evidence_subject(row.get(2)?, row.get(3)?)
+            .map_err(|error| invalid_column(3, error))?,
+        source: parse_ingest_evidence_source(row.get(4)?),
+        observations: parse_observed_values(row.get(5)?)
+            .map_err(|error| invalid_column(5, error))?,
+        structured_payload: row.get(6)?,
+        captured_at_unix_seconds: row.get(7)?,
+    })
+}
+
+fn map_metadata_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<MetadataSnapshot> {
+    Ok(MetadataSnapshot {
+        id: parse_uuid_id::<MetadataSnapshotId>(row.get_ref(0)?, 0)?,
+        subject: parse_metadata_subject(row.get(1)?, row.get(2)?)
+            .map_err(|error| invalid_column(2, error))?,
+        source: parse_metadata_snapshot_source(row.get(3)?),
+        format: parse_snapshot_format(row.get(4)?),
+        payload: row.get(5)?,
+        captured_at_unix_seconds: row.get(6)?,
+    })
+}
+
 fn map_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
     let subject_kind: String = row.get(3)?;
     let subject_id: Option<String> = row.get(4)?;
@@ -1228,13 +1526,17 @@ impl_parse_uuid_id!(
     ArtistId,
     CandidateMatchId,
     ExportedMetadataSnapshotId,
+    FileId,
     ImportBatchId,
+    IngestEvidenceId,
     IssueId,
     JobId,
+    MetadataSnapshotId,
     ReleaseGroupId,
     ReleaseId,
     ReleaseInstanceId,
     SourceId,
+    StagingManifestId,
     TrackInstanceId,
     MusicBrainzReleaseGroupId,
     MusicBrainzReleaseId
@@ -1547,6 +1849,429 @@ fn source_locator_to_sql(locator: &SourceLocator) -> (&'static str, String) {
     }
 }
 
+fn parse_grouping_strategy(value: String) -> GroupingStrategy {
+    match value.as_str() {
+        "common_parent_directory" => GroupingStrategy::CommonParentDirectory,
+        "shared_album_metadata" => GroupingStrategy::SharedAlbumMetadata,
+        "track_number_continuity" => GroupingStrategy::TrackNumberContinuity,
+        _ => GroupingStrategy::ManualManifest,
+    }
+}
+
+fn grouping_strategy_to_sql(value: &GroupingStrategy) -> &'static str {
+    match value {
+        GroupingStrategy::CommonParentDirectory => "common_parent_directory",
+        GroupingStrategy::SharedAlbumMetadata => "shared_album_metadata",
+        GroupingStrategy::TrackNumberContinuity => "track_number_continuity",
+        GroupingStrategy::ManualManifest => "manual_manifest",
+    }
+}
+
+fn parse_auxiliary_file_role(value: &str, description: Option<String>) -> AuxiliaryFileRole {
+    match value {
+        "gazelle_yaml" => AuxiliaryFileRole::GazelleYaml,
+        "artwork" => AuxiliaryFileRole::Artwork,
+        "cue_sheet" => AuxiliaryFileRole::CueSheet,
+        "log" => AuxiliaryFileRole::Log,
+        _ => AuxiliaryFileRole::Other {
+            description: description.unwrap_or_else(|| "other".to_string()),
+        },
+    }
+}
+
+fn auxiliary_file_role_to_sql(value: &AuxiliaryFileRole) -> (&'static str, Option<String>) {
+    match value {
+        AuxiliaryFileRole::GazelleYaml => ("gazelle_yaml", None),
+        AuxiliaryFileRole::Artwork => ("artwork", None),
+        AuxiliaryFileRole::CueSheet => ("cue_sheet", None),
+        AuxiliaryFileRole::Log => ("log", None),
+        AuxiliaryFileRole::Other { description } => ("other", Some(description.clone())),
+    }
+}
+
+fn parse_file_fingerprint(value: &Value) -> Result<FileFingerprint, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "file fingerprint must be an object".to_string())?;
+    let kind = get_json_string(object, "kind")?;
+    let value = get_json_string(object, "value")?;
+    match kind.as_str() {
+        "content_hash" => Ok(FileFingerprint::ContentHash(value)),
+        "lightweight" => Ok(FileFingerprint::LightweightFingerprint(value)),
+        _ => Err(format!("unknown file fingerprint kind '{kind}'")),
+    }
+}
+
+fn file_fingerprint_to_json(value: &FileFingerprint) -> Value {
+    match value {
+        FileFingerprint::ContentHash(hash) => {
+            json!({ "kind": "content_hash", "value": hash })
+        }
+        FileFingerprint::LightweightFingerprint(fingerprint) => {
+            json!({ "kind": "lightweight", "value": fingerprint })
+        }
+    }
+}
+
+fn observed_tag_to_json(value: &ObservedTag) -> Value {
+    json!({
+        "key": value.key,
+        "value": value.value,
+    })
+}
+
+fn parse_observed_tag(value: &Value) -> Result<ObservedTag, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "observed tag must be an object".to_string())?;
+    Ok(ObservedTag {
+        key: get_json_string(object, "key")?,
+        value: get_json_string(object, "value")?,
+    })
+}
+
+fn serialize_staged_files(values: &[StagedFile]) -> Result<String, RepositoryError> {
+    serde_json::to_string(
+        &values
+            .iter()
+            .map(|value| {
+                json!({
+                    "path": value.path.to_string_lossy(),
+                    "fingerprint": file_fingerprint_to_json(&value.fingerprint),
+                    "observed_tags": value
+                        .observed_tags
+                        .iter()
+                        .map(observed_tag_to_json)
+                        .collect::<Vec<_>>(),
+                    "duration_ms": value.duration_ms,
+                    "format_family": format_family_to_sql(&value.format_family),
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| storage_error(format!("failed to serialize staged files: {error}")))
+}
+
+fn parse_staged_files(raw: String) -> Result<Vec<StagedFile>, String> {
+    let values: Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+    values
+        .as_array()
+        .ok_or_else(|| "staged files must be a JSON array".to_string())?
+        .iter()
+        .map(|value| {
+            let object = value
+                .as_object()
+                .ok_or_else(|| "staged file must be an object".to_string())?;
+            let observed_tags = object
+                .get("observed_tags")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "staged file observed_tags must be an array".to_string())?
+                .iter()
+                .map(parse_observed_tag)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(StagedFile {
+                path: PathBuf::from(get_json_string(object, "path")?),
+                fingerprint: parse_file_fingerprint(
+                    object
+                        .get("fingerprint")
+                        .ok_or_else(|| "staged file fingerprint is required".to_string())?,
+                )?,
+                observed_tags,
+                duration_ms: object
+                    .get("duration_ms")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as u32),
+                format_family: parse_format_family(get_json_string(object, "format_family")?),
+            })
+        })
+        .collect()
+}
+
+fn serialize_auxiliary_files(values: &[AuxiliaryFile]) -> Result<String, RepositoryError> {
+    serde_json::to_string(
+        &values
+            .iter()
+            .map(|value| {
+                let (role, description) = auxiliary_file_role_to_sql(&value.role);
+                json!({
+                    "path": value.path.to_string_lossy(),
+                    "role": role,
+                    "description": description,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| storage_error(format!("failed to serialize auxiliary files: {error}")))
+}
+
+fn parse_auxiliary_files(raw: String) -> Result<Vec<AuxiliaryFile>, String> {
+    let values: Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+    values
+        .as_array()
+        .ok_or_else(|| "auxiliary files must be a JSON array".to_string())?
+        .iter()
+        .map(|value| {
+            let object = value
+                .as_object()
+                .ok_or_else(|| "auxiliary file must be an object".to_string())?;
+            Ok(AuxiliaryFile {
+                path: PathBuf::from(get_json_string(object, "path")?),
+                role: parse_auxiliary_file_role(
+                    &get_json_string(object, "role")?,
+                    object
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                ),
+            })
+        })
+        .collect()
+}
+
+fn serialize_staged_release_groups(
+    values: &[StagedReleaseGroup],
+) -> Result<String, RepositoryError> {
+    serde_json::to_string(
+        &values
+            .iter()
+            .map(|value| {
+                json!({
+                    "key": value.key,
+                    "file_paths": value
+                        .file_paths
+                        .iter()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect::<Vec<_>>(),
+                    "auxiliary_paths": value
+                        .auxiliary_paths
+                        .iter()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| {
+        storage_error(format!(
+            "failed to serialize staged release groups: {error}"
+        ))
+    })
+}
+
+fn parse_staged_release_groups(raw: String) -> Result<Vec<StagedReleaseGroup>, String> {
+    let values: Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+    values
+        .as_array()
+        .ok_or_else(|| "staged release groups must be a JSON array".to_string())?
+        .iter()
+        .map(|value| {
+            let object = value
+                .as_object()
+                .ok_or_else(|| "staged release group must be an object".to_string())?;
+            Ok(StagedReleaseGroup {
+                key: get_json_string(object, "key")?,
+                file_paths: parse_path_array(
+                    object.get("file_paths").ok_or_else(|| {
+                        "staged release group file_paths are required".to_string()
+                    })?,
+                )?,
+                auxiliary_paths: parse_path_array(object.get("auxiliary_paths").ok_or_else(
+                    || "staged release group auxiliary_paths are required".to_string(),
+                )?)?,
+            })
+        })
+        .collect()
+}
+
+fn parse_path_array(value: &Value) -> Result<Vec<PathBuf>, String> {
+    value
+        .as_array()
+        .ok_or_else(|| "path list must be an array".to_string())?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(PathBuf::from)
+                .ok_or_else(|| "path list entries must be strings".to_string())
+        })
+        .collect()
+}
+
+fn parse_ingest_evidence_source(value: String) -> IngestEvidenceSource {
+    match value.as_str() {
+        "embedded_tags" => IngestEvidenceSource::EmbeddedTags,
+        "file_name" => IngestEvidenceSource::FileName,
+        "directory_structure" => IngestEvidenceSource::DirectoryStructure,
+        "gazelle_yaml" => IngestEvidenceSource::GazelleYaml,
+        _ => IngestEvidenceSource::AuxiliaryFile,
+    }
+}
+
+fn ingest_evidence_source_to_sql(value: &IngestEvidenceSource) -> &'static str {
+    match value {
+        IngestEvidenceSource::EmbeddedTags => "embedded_tags",
+        IngestEvidenceSource::FileName => "file_name",
+        IngestEvidenceSource::DirectoryStructure => "directory_structure",
+        IngestEvidenceSource::GazelleYaml => "gazelle_yaml",
+        IngestEvidenceSource::AuxiliaryFile => "auxiliary_file",
+    }
+}
+
+fn parse_ingest_evidence_subject(
+    kind: String,
+    value: String,
+) -> Result<IngestEvidenceSubject, String> {
+    match kind.as_str() {
+        "discovered_path" => Ok(IngestEvidenceSubject::DiscoveredPath(PathBuf::from(value))),
+        "grouped_release_input" => {
+            Ok(IngestEvidenceSubject::GroupedReleaseInput { group_key: value })
+        }
+        _ => Err(format!("unknown ingest evidence subject kind '{kind}'")),
+    }
+}
+
+fn ingest_evidence_subject_to_sql(value: &IngestEvidenceSubject) -> (&'static str, String) {
+    match value {
+        IngestEvidenceSubject::DiscoveredPath(path) => {
+            ("discovered_path", path.to_string_lossy().to_string())
+        }
+        IngestEvidenceSubject::GroupedReleaseInput { group_key } => {
+            ("grouped_release_input", group_key.clone())
+        }
+    }
+}
+
+fn parse_observed_value_kind(value: &str) -> Result<ObservedValueKind, String> {
+    match value {
+        "artist" => Ok(ObservedValueKind::Artist),
+        "release_title" => Ok(ObservedValueKind::ReleaseTitle),
+        "release_year" => Ok(ObservedValueKind::ReleaseYear),
+        "track_title" => Ok(ObservedValueKind::TrackTitle),
+        "track_number" => Ok(ObservedValueKind::TrackNumber),
+        "disc_number" => Ok(ObservedValueKind::DiscNumber),
+        "duration_ms" => Ok(ObservedValueKind::DurationMs),
+        "format_family" => Ok(ObservedValueKind::FormatFamily),
+        "media_descriptor" => Ok(ObservedValueKind::MediaDescriptor),
+        "source_descriptor" => Ok(ObservedValueKind::SourceDescriptor),
+        "tracker_identifier" => Ok(ObservedValueKind::TrackerIdentifier),
+        _ => Err(format!("unknown observed value kind '{value}'")),
+    }
+}
+
+fn observed_value_kind_to_sql(value: &ObservedValueKind) -> &'static str {
+    match value {
+        ObservedValueKind::Artist => "artist",
+        ObservedValueKind::ReleaseTitle => "release_title",
+        ObservedValueKind::ReleaseYear => "release_year",
+        ObservedValueKind::TrackTitle => "track_title",
+        ObservedValueKind::TrackNumber => "track_number",
+        ObservedValueKind::DiscNumber => "disc_number",
+        ObservedValueKind::DurationMs => "duration_ms",
+        ObservedValueKind::FormatFamily => "format_family",
+        ObservedValueKind::MediaDescriptor => "media_descriptor",
+        ObservedValueKind::SourceDescriptor => "source_descriptor",
+        ObservedValueKind::TrackerIdentifier => "tracker_identifier",
+    }
+}
+
+fn serialize_observed_values(values: &[ObservedValue]) -> Result<String, RepositoryError> {
+    serde_json::to_string(
+        &values
+            .iter()
+            .map(|value| {
+                json!({
+                    "kind": observed_value_kind_to_sql(&value.kind),
+                    "value": value.value,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| storage_error(format!("failed to serialize observed values: {error}")))
+}
+
+fn parse_observed_values(raw: String) -> Result<Vec<ObservedValue>, String> {
+    let values: Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+    values
+        .as_array()
+        .ok_or_else(|| "observed values must be a JSON array".to_string())?
+        .iter()
+        .map(|value| {
+            let object = value
+                .as_object()
+                .ok_or_else(|| "observed value must be an object".to_string())?;
+            Ok(ObservedValue {
+                kind: parse_observed_value_kind(&get_json_string(object, "kind")?)?,
+                value: get_json_string(object, "value")?,
+            })
+        })
+        .collect()
+}
+
+fn parse_metadata_snapshot_source(value: String) -> MetadataSnapshotSource {
+    match value.as_str() {
+        "embedded_tags" => MetadataSnapshotSource::EmbeddedTags,
+        "filename_heuristics" => MetadataSnapshotSource::FileNameHeuristics,
+        "directory_structure" => MetadataSnapshotSource::DirectoryStructure,
+        "gazelle_yaml" => MetadataSnapshotSource::GazelleYaml,
+        "musicbrainz_payload" => MetadataSnapshotSource::MusicBrainzPayload,
+        _ => MetadataSnapshotSource::DiscogsPayload,
+    }
+}
+
+fn metadata_snapshot_source_to_sql(value: &MetadataSnapshotSource) -> &'static str {
+    match value {
+        MetadataSnapshotSource::EmbeddedTags => "embedded_tags",
+        MetadataSnapshotSource::FileNameHeuristics => "filename_heuristics",
+        MetadataSnapshotSource::DirectoryStructure => "directory_structure",
+        MetadataSnapshotSource::GazelleYaml => "gazelle_yaml",
+        MetadataSnapshotSource::MusicBrainzPayload => "musicbrainz_payload",
+        MetadataSnapshotSource::DiscogsPayload => "discogs_payload",
+    }
+}
+
+fn parse_snapshot_format(value: String) -> SnapshotFormat {
+    match value.as_str() {
+        "json" => SnapshotFormat::Json,
+        "yaml" => SnapshotFormat::Yaml,
+        _ => SnapshotFormat::Text,
+    }
+}
+
+fn snapshot_format_to_sql(value: &SnapshotFormat) -> &'static str {
+    match value {
+        SnapshotFormat::Json => "json",
+        SnapshotFormat::Yaml => "yaml",
+        SnapshotFormat::Text => "text",
+    }
+}
+
+fn parse_metadata_subject(kind: String, value: String) -> Result<MetadataSubject, String> {
+    match kind.as_str() {
+        "import_batch" => Ok(MetadataSubject::ImportBatch(
+            ImportBatchId::parse_str(&value).map_err(|error| error.to_string())?,
+        )),
+        "release_instance" => Ok(MetadataSubject::ReleaseInstance(
+            ReleaseInstanceId::parse_str(&value).map_err(|error| error.to_string())?,
+        )),
+        "file" => Ok(MetadataSubject::File(
+            FileId::parse_str(&value).map_err(|error| error.to_string())?,
+        )),
+        _ => Err(format!("unknown metadata subject kind '{kind}'")),
+    }
+}
+
+fn metadata_subject_to_sql(value: &MetadataSubject) -> (&'static str, String) {
+    match value {
+        MetadataSubject::ImportBatch(id) => ("import_batch", id.as_uuid().to_string()),
+        MetadataSubject::ReleaseInstance(id) => ("release_instance", id.as_uuid().to_string()),
+        MetadataSubject::File(id) => ("file", id.as_uuid().to_string()),
+    }
+}
+
+fn serialize_string_array(values: &[String]) -> Result<String, RepositoryError> {
+    serde_json::to_string(values)
+        .map_err(|error| storage_error(format!("failed to serialize string array: {error}")))
+}
+
 fn parse_issue_type(value: String) -> IssueType {
     match value.as_str() {
         "unmatched_release" => IssueType::UnmatchedRelease,
@@ -1786,13 +2511,18 @@ impl std::error::Error for SimpleError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::config::ValidatedRuntimeConfig;
+    use crate::application::ingest::WatchDiscoveryService;
     use crate::application::repository::{
-        ExportRepository, IssueRepository, JobCommandRepository, JobRepository,
-        ReleaseInstanceRepository, ReleaseRepository,
+        ExportRepository, IngestEvidenceRepository, IssueRepository, JobCommandRepository,
+        JobRepository, MetadataSnapshotRepository, ReleaseInstanceRepository, ReleaseRepository,
+        StagingManifestRepository,
     };
     use crate::domain::issue::IssueState;
     use crate::domain::job::{JobStatus, JobSubject, JobTrigger, JobType};
+    use crate::domain::metadata_snapshot::{MetadataSnapshotSource, SnapshotFormat};
     use crate::domain::release_instance::{FormatFamily, ReleaseInstanceState};
+    use id3::TagLike;
     use uuid::Uuid;
 
     #[test]
@@ -1824,6 +2554,12 @@ mod tests {
         assert!(tables.contains(&"release_instances".to_string()));
         assert!(tables.contains(&"jobs".to_string()));
 
+        connection
+            .execute_batch(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/migrations/0003_analyzer_output.down.sql"
+            )))
+            .expect("analyzer rollback should succeed");
         connection
             .execute_batch(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -2031,6 +2767,80 @@ mod tests {
         assert!(recoverable.iter().all(|candidate| {
             matches!(candidate.status, JobStatus::Queued | JobStatus::Running)
         }));
+    }
+
+    #[test]
+    fn repositories_persist_batch_analysis_output_with_sqlite() {
+        let database_path =
+            std::env::temp_dir().join(format!("discern-analyze-test-{}.db", Uuid::new_v4()));
+        let context = SqliteRepositoryContext::open(&database_path).expect("context should open");
+        context
+            .with_write_transaction(|transaction| {
+                apply_migrations(transaction)?;
+                Ok(())
+            })
+            .expect("migrations should apply");
+        let repositories = SqliteRepositories::new(context.clone());
+
+        let temp_root =
+            std::env::temp_dir().join(format!("discern-analyze-fixture-{}", Uuid::new_v4()));
+        let album_path = temp_root.join("Kid A");
+        std::fs::create_dir_all(&album_path).expect("album directory should be created");
+        let mp3_path = album_path.join("01 Everything.mp3");
+        std::fs::write(&mp3_path, b"").expect("mp3 placeholder should exist");
+
+        let mut tag = id3::Tag::new();
+        tag.set_artist("Radiohead");
+        tag.set_album("Kid A");
+        tag.set_title("Everything in Its Right Place");
+        tag.write_to_path(&mp3_path, id3::Version::Id3v24)
+            .expect("id3 tag should be written");
+
+        let yaml_path = album_path.join("release.yaml");
+        std::fs::write(
+            &yaml_path,
+            "release_name: Kid A\nartist: Radiohead\nyear: 2000\n",
+        )
+        .expect("yaml should be written");
+
+        let config =
+            ValidatedRuntimeConfig::from_validated_app_config(&crate::config::AppConfig::default());
+        let service = WatchDiscoveryService::new(repositories.clone(), config);
+        let submission = service
+            .submit_manual_path("chris", album_path.clone(), 500)
+            .expect("manual intake should succeed");
+
+        let report = service
+            .analyze_import_batch(&submission.batch.id, 501)
+            .expect("batch analysis should succeed");
+
+        let manifests = repositories
+            .list_staging_manifests_for_batch(&submission.batch.id)
+            .expect("manifest query should succeed");
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0], report.manifest);
+
+        let evidence = repositories
+            .list_ingest_evidence_for_batch(&submission.batch.id)
+            .expect("evidence query should succeed");
+        assert_eq!(evidence.len(), 2);
+
+        let snapshots = repositories
+            .list_metadata_snapshots_for_batch(&submission.batch.id)
+            .expect("snapshot query should succeed");
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots.iter().any(|snapshot| {
+            snapshot.source == MetadataSnapshotSource::GazelleYaml
+                && snapshot.format == SnapshotFormat::Yaml
+        }));
+
+        let updated_batch = repositories
+            .get_import_batch(&submission.batch.id)
+            .expect("batch query should succeed")
+            .expect("batch should exist");
+        assert_eq!(updated_batch.status, ImportBatchStatus::Grouped);
+
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 
     fn seeded_context() -> (SqliteRepositoryContext, PathBuf) {
@@ -2333,6 +3143,12 @@ mod tests {
             .execute_batch(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/migrations/0002_indexes.up.sql"
+            )))
+            .map_err(to_storage_error)?;
+        transaction
+            .execute_batch(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/migrations/0003_analyzer_output.up.sql"
             )))
             .map_err(to_storage_error)?;
         Ok(())
