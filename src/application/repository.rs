@@ -12,6 +12,7 @@ use crate::domain::release_group::ReleaseGroup;
 use crate::domain::release_instance::{FormatFamily, ReleaseInstance, ReleaseInstanceState};
 use crate::domain::source::{Source, SourceLocator};
 use crate::domain::staging_manifest::StagingManifest;
+use crate::domain::track::Track;
 use crate::support::ids::{
     CandidateMatchId, ExportedMetadataSnapshotId, ImportBatchId, IssueId, JobId, ManualOverrideId,
     ReleaseGroupId, ReleaseId, ReleaseInstanceId,
@@ -61,6 +62,11 @@ pub trait ReleaseRepository {
     ) -> Result<Page<ReleaseGroup>, RepositoryError>;
 
     fn list_releases(&self, query: &ReleaseListQuery) -> Result<Page<Release>, RepositoryError>;
+
+    fn list_tracks_for_release(
+        &self,
+        release_id: &ReleaseId,
+    ) -> Result<Vec<Track>, RepositoryError>;
 }
 
 pub trait ReleaseCommandRepository {

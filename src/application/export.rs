@@ -569,6 +569,13 @@ mod tests {
         ) -> Result<Page<Release>, RepositoryError> {
             unimplemented!("not needed in export tests")
         }
+
+        fn list_tracks_for_release(
+            &self,
+            _release_id: &ReleaseId,
+        ) -> Result<Vec<crate::domain::track::Track>, RepositoryError> {
+            unimplemented!("not needed in export tests")
+        }
     }
 
     impl ManualOverrideRepository for InMemoryExportRepository {

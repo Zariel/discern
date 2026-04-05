@@ -48,6 +48,7 @@ use crate::domain::staging_manifest::{
     AuxiliaryFile, AuxiliaryFileRole, FileFingerprint, GroupingDecision, GroupingStrategy,
     ObservedTag, StagedFile, StagedReleaseGroup, StagingManifest, StagingManifestSource,
 };
+use crate::domain::track::{Track, TrackPosition};
 use crate::support::ids::{
     ArtistId, CandidateMatchId, DiscogsReleaseId, ExportedMetadataSnapshotId, FileId,
     ImportBatchId, IngestEvidenceId, IssueId, JobId, ManualOverrideId, MetadataSnapshotId,
@@ -325,6 +326,27 @@ impl ReleaseRepository for SqliteRepositories {
             request: query.page,
             total: total as u64,
         })
+    }
+
+    fn list_tracks_for_release(
+        &self,
+        release_id: &ReleaseId,
+    ) -> Result<Vec<Track>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, release_id, disc_number, track_number, title,
+                        musicbrainz_track_id, duration_ms
+                 FROM tracks
+                 WHERE release_id = ?1
+                 ORDER BY disc_number ASC, track_number ASC",
+            )
+            .map_err(to_storage_error)?;
+        statement
+            .query_map(params![release_id.as_uuid().to_string()], map_track)
+            .map_err(to_storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_storage_error)
     }
 }
 
@@ -1875,6 +1897,25 @@ fn map_release_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReleaseInst
                     release_group_id: row.get(17).unwrap_or(None),
                 }),
         },
+    })
+}
+
+fn map_track(row: &rusqlite::Row<'_>) -> rusqlite::Result<Track> {
+    Ok(Track {
+        id: parse_uuid_id::<TrackId>(row.get_ref(0)?, 0)?,
+        release_id: parse_uuid_id::<ReleaseId>(row.get_ref(1)?, 1)?,
+        position: TrackPosition {
+            disc_number: row.get::<_, i64>(2)? as u16,
+            track_number: row.get::<_, i64>(3)? as u16,
+        },
+        title: row.get(4)?,
+        musicbrainz_track_id: row
+            .get::<_, Option<String>>(5)?
+            .as_deref()
+            .map(crate::support::ids::MusicBrainzTrackId::parse_str)
+            .transpose()
+            .map_err(|error| invalid_column(5, error.to_string()))?,
+        duration_ms: row.get::<_, Option<i64>>(6)?.map(|value| value as u32),
     })
 }
 
@@ -3504,6 +3545,22 @@ mod tests {
     }
 
     #[test]
+    fn repositories_list_canonical_tracks_for_release() {
+        let (context, _path) = seeded_context();
+        let repositories = SqliteRepositories::new(context);
+
+        let tracks = repositories
+            .list_tracks_for_release(&parse_uuid(SeedIds::RELEASE))
+            .expect("track query should succeed");
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].position.disc_number, 1);
+        assert_eq!(tracks[0].position.track_number, 1);
+        assert_eq!(tracks[0].title, "15 Step");
+        assert_eq!(tracks[1].position.track_number, 2);
+        assert_eq!(tracks[1].title, "Bodysnatchers");
+    }
+
+    #[test]
     fn repositories_persist_provisional_release_instances_and_candidates() {
         let (context, _path) = seeded_context();
         let repositories = SqliteRepositories::new(context);
@@ -4070,6 +4127,26 @@ mod tests {
             .map_err(to_storage_error)?;
         transaction
             .execute(
+                "INSERT INTO tracks
+                 (id, release_id, disc_number, track_number, title, normalized_title,
+                  musicbrainz_track_id, duration_ms)
+                 VALUES (?1, ?2, 1, 1, '15 Step', '15 step',
+                         'd1d1d1d1-d1d1-41d1-81d1-d1d1d1d1d1d1', 237000)",
+                params![SeedIds::TRACK_ONE, SeedIds::RELEASE],
+            )
+            .map_err(to_storage_error)?;
+        transaction
+            .execute(
+                "INSERT INTO tracks
+                 (id, release_id, disc_number, track_number, title, normalized_title,
+                  musicbrainz_track_id, duration_ms)
+                 VALUES (?1, ?2, 1, 2, 'Bodysnatchers', 'bodysnatchers',
+                         'd2d2d2d2-d2d2-42d2-82d2-d2d2d2d2d2d2', 242000)",
+                params![SeedIds::TRACK_TWO, SeedIds::RELEASE],
+            )
+            .map_err(to_storage_error)?;
+        transaction
+            .execute(
                 "INSERT INTO candidate_matches
                  (id, release_instance_id, provider, candidate_kind, provider_entity_id,
                   normalized_score, evidence_matches_json, mismatches_json,
@@ -4255,6 +4332,8 @@ mod tests {
         const MB_RELEASE_GROUP: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
         const MB_RELEASE: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
         const SECOND_MB_RELEASE: &str = "cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd";
+        const TRACK_ONE: &str = "cececece-cece-4ece-8ece-cececececece";
+        const TRACK_TWO: &str = "cfcfcfcf-cfcf-4fcf-8fcf-cfcfcfcfcfcf";
         const UNUSED_RELEASE: &str = "dededede-dede-dede-dede-dededededede";
         const UNUSED_ISSUE: &str = "efefefef-efef-efef-efef-efefefefefef";
         const UNUSED_EXPORT: &str = "f0f0f0f0-f0f0-f0f0-f0f0-f0f0f0f0f0f0";

@@ -6,6 +6,7 @@ pub mod jobs;
 pub mod matching;
 pub mod repository;
 pub mod services;
+pub mod tagging;
 pub mod workers;
 
 pub use config::ValidatedRuntimeConfig;

@@ -2857,6 +2857,13 @@ mod tests {
         ) -> Result<Page<Release>, RepositoryError> {
             unimplemented!("not needed in matching tests")
         }
+
+        fn list_tracks_for_release(
+            &self,
+            _release_id: &crate::support::ids::ReleaseId,
+        ) -> Result<Vec<crate::domain::track::Track>, RepositoryError> {
+            unimplemented!("not needed in matching tests")
+        }
     }
 
     impl ReleaseCommandRepository for InMemoryMatchingRepository {
