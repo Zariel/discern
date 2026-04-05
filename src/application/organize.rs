@@ -834,6 +834,14 @@ mod tests {
             .expect("managed files should load");
         assert_eq!(stored_files.len(), 1);
         assert_eq!(stored_files[0].path, target);
+        assert_eq!(
+            render_organization_golden(
+                &config.storage.managed_library_root,
+                &report,
+                &stored_files
+            ),
+            include_str!("../../tests/golden/organized_copy_path.txt")
+        );
 
         let _ = fs::remove_dir_all(temp_root);
     }
@@ -1370,5 +1378,41 @@ mod tests {
         let root = std::env::temp_dir().join(format!("discern-{label}-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).expect("temp root should exist");
         root
+    }
+
+    fn render_organization_golden(
+        managed_root: &Path,
+        report: &OrganizationReport,
+        stored_files: &[FileRecord],
+    ) -> String {
+        let organized = report
+            .organized_files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(managed_root)
+                    .expect("organized file should be under managed root")
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let managed = stored_files
+            .iter()
+            .map(|file| {
+                file.path
+                    .strip_prefix(managed_root)
+                    .expect("managed file should be under managed root")
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let mode = match report.mode {
+            ImportMode::Copy => "copy",
+            ImportMode::Move => "move",
+            ImportMode::Hardlink => "hardlink",
+        };
+
+        format!("mode={mode}\norganized_files={organized}\nmanaged_files={managed}\n")
     }
 }

@@ -778,6 +778,9 @@ mod tests {
                     .to_string()
             ]
         );
+        let expected = include_str!("../../tests/golden/tagging_player_fields.txt");
+        assert_eq!(render_mp3_tag_golden(&mp3_tag), expected);
+        assert_eq!(render_flac_tag_golden(comments), expected);
 
         let _ = fs::remove_dir_all(temp_root);
     }
@@ -1250,5 +1253,65 @@ mod tests {
         tag.push_block(metaflac::Block::StreamInfo(stream_info));
         tag.write_to_path(path)
             .expect("minimal flac should be written");
+    }
+
+    fn render_mp3_tag_golden(tag: &id3::Tag) -> String {
+        let album_id = tag
+            .extended_texts()
+            .find(|item| item.description == "MusicBrainz Album Id")
+            .map(|item| item.value.clone())
+            .unwrap_or_default();
+        let track_id = tag
+            .extended_texts()
+            .find(|item| item.description == "MusicBrainz Track Id")
+            .map(|item| item.value.clone())
+            .unwrap_or_default();
+        format!(
+            concat!(
+                "album={}\n",
+                "album_artist={}\n",
+                "artist={}\n",
+                "title={}\n",
+                "track_number={}\n",
+                "musicbrainz_album_id={}\n",
+                "musicbrainz_track_id={}\n"
+            ),
+            tag.album().unwrap_or_default(),
+            tag.album_artist().unwrap_or_default(),
+            tag.artist().unwrap_or_default(),
+            tag.title().unwrap_or_default(),
+            tag.track().unwrap_or_default(),
+            album_id,
+            track_id,
+        )
+    }
+
+    fn render_flac_tag_golden(comments: &metaflac::block::VorbisComment) -> String {
+        format!(
+            concat!(
+                "album={}\n",
+                "album_artist={}\n",
+                "artist={}\n",
+                "title={}\n",
+                "track_number={}\n",
+                "musicbrainz_album_id={}\n",
+                "musicbrainz_track_id={}\n"
+            ),
+            first_vorbis(comments, "ALBUM"),
+            first_vorbis(comments, "ALBUMARTIST"),
+            first_vorbis(comments, "ARTIST"),
+            first_vorbis(comments, "TITLE"),
+            first_vorbis(comments, "TRACKNUMBER"),
+            first_vorbis(comments, "MUSICBRAINZ_ALBUMID"),
+            first_vorbis(comments, "MUSICBRAINZ_TRACKID"),
+        )
+    }
+
+    fn first_vorbis(comments: &metaflac::block::VorbisComment, key: &str) -> String {
+        comments
+            .get(key)
+            .and_then(|values| values.first())
+            .cloned()
+            .unwrap_or_default()
     }
 }

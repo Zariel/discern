@@ -1,0 +1,7 @@
+album=Kid A [2000]
+album_artist=Radiohead
+artist=Radiohead
+title=Everything in Its Right Place
+track_number=1
+musicbrainz_album_id=55555555-5555-4555-8555-555555555555
+musicbrainz_track_id=66666666-6666-4666-8666-666666666666

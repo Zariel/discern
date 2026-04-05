@@ -363,6 +363,10 @@ mod tests {
             snapshot.primary_artwork_filename,
             Some("cover.jpg".to_string())
         );
+        assert_eq!(
+            render_snapshot_golden(&snapshot),
+            include_str!("../../tests/golden/export_snapshot_generic_player.txt")
+        );
     }
 
     #[test]
@@ -689,5 +693,30 @@ mod tests {
         ) -> Result<Option<ExportedMetadataSnapshot>, RepositoryError> {
             unimplemented!("not needed in export tests")
         }
+    }
+
+    fn render_snapshot_golden(snapshot: &ExportedMetadataSnapshot) -> String {
+        format!(
+            concat!(
+                "album_title={}\n",
+                "album_artist={}\n",
+                "artist_credits={}\n",
+                "edition_visibility={:?}\n",
+                "technical_visibility={:?}\n",
+                "path_components={}\n",
+                "primary_artwork_filename={}\n",
+                "compatibility_verified={}\n",
+                "compatibility_warnings={}\n"
+            ),
+            snapshot.album_title,
+            snapshot.album_artist,
+            snapshot.artist_credits.join("; "),
+            snapshot.edition_visibility,
+            snapshot.technical_visibility,
+            snapshot.path_components.join(" | "),
+            snapshot.primary_artwork_filename.as_deref().unwrap_or(""),
+            snapshot.compatibility.verified,
+            snapshot.compatibility.warnings.join(" | "),
+        )
     }
 }

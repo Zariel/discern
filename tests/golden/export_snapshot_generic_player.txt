@@ -1,0 +1,9 @@
+album_title=Kid A [2011 CD]
+album_artist=Unknown Artist
+artist_credits=Unknown Artist
+edition_visibility=TagsAndPath
+technical_visibility=PathOnly
+path_components=Unknown Artist | Kid A [2011 CD] [FLAC lossless]
+primary_artwork_filename=cover.jpg
+compatibility_verified=true
+compatibility_warnings=
