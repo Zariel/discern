@@ -7,6 +7,9 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
+use crate::application::matching::{
+    MusicBrainzMetadataProvider, MusicBrainzReleaseCandidate, MusicBrainzReleaseGroupCandidate,
+};
 use crate::config::MusicBrainzConfig;
 
 const DEFAULT_BASE_URL: &str = "https://musicbrainz.org/ws/2";
@@ -514,6 +517,65 @@ impl From<ReleaseLookupResponse> for MusicBrainzReleaseDetail {
             label_info: value.label_info.into_iter().map(Into::into).collect(),
             media: value.media.into_iter().map(Into::into).collect(),
         }
+    }
+}
+
+impl MusicBrainzMetadataProvider for MusicBrainzClient {
+    async fn search_releases(
+        &self,
+        query: &str,
+        limit: u8,
+    ) -> Result<Vec<MusicBrainzReleaseCandidate>, String> {
+        MusicBrainzClient::search_releases(self, query, limit)
+            .await
+            .map(|items| {
+                items
+                    .into_iter()
+                    .map(|item| MusicBrainzReleaseCandidate {
+                        id: item.id,
+                        title: item.title,
+                        score: item.score,
+                        artist_names: item
+                            .artist_credit
+                            .into_iter()
+                            .map(|artist| artist.artist_name)
+                            .collect(),
+                        release_group_id: item.release_group.as_ref().map(|group| group.id.clone()),
+                        release_group_title: item.release_group.map(|group| group.title),
+                        country: item.country,
+                        date: item.date,
+                        track_count: item.track_count,
+                    })
+                    .collect()
+            })
+            .map_err(|error| error.message)
+    }
+
+    async fn search_release_groups(
+        &self,
+        query: &str,
+        limit: u8,
+    ) -> Result<Vec<MusicBrainzReleaseGroupCandidate>, String> {
+        MusicBrainzClient::search_release_groups(self, query, limit)
+            .await
+            .map(|items| {
+                items
+                    .into_iter()
+                    .map(|item| MusicBrainzReleaseGroupCandidate {
+                        id: item.id,
+                        title: item.title,
+                        score: item.score,
+                        artist_names: item
+                            .artist_credit
+                            .into_iter()
+                            .map(|artist| artist.artist_name)
+                            .collect(),
+                        primary_type: item.primary_type,
+                        first_release_date: item.first_release_date,
+                    })
+                    .collect()
+            })
+            .map_err(|error| error.message)
     }
 }
 
