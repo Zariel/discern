@@ -731,14 +731,116 @@ mod tests {
     use crate::domain::import_batch::ImportMode;
 
     use super::{
-        AppConfig, ConfigError, ConfigValidationIssue, ConfigValidationReport,
+        AppConfig, ConfigError, ConfigValidationIssue, ConfigValidationReport, DuplicatePolicy,
         EditionVisibilityPolicy, UnknownTagPolicy, VariantVisibilityPolicy, WatchDirectoryConfig,
         WatchScanMode,
     };
 
+    fn representative_config_fixture() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.storage.sqlite_path = PathBuf::from("/var/lib/discern/discern.db");
+        config.storage.managed_library_root = PathBuf::from("/srv/music/library");
+        config.storage.watch_directories = vec![
+            WatchDirectoryConfig {
+                name: "lossless-drop".to_string(),
+                path: PathBuf::from("/srv/import/lossless"),
+                scan_mode: WatchScanMode::EventDriven,
+                import_mode_override: None,
+            },
+            WatchDirectoryConfig {
+                name: "lossy-rescans".to_string(),
+                path: PathBuf::from("/srv/import/lossy"),
+                scan_mode: WatchScanMode::PollingOnly,
+                import_mode_override: Some(ImportMode::Copy),
+            },
+        ];
+        config.import.duplicate_policy = DuplicatePolicy::Flag;
+        config.providers.musicbrainz.contact_email = Some("ops@example.com".to_string());
+        config.providers.discogs.enabled = true;
+        config.providers.discogs.personal_access_token = Some("discogs-token".to_string());
+        config.providers.discogs.rate_limit_per_second = 2;
+        config.workers.max_concurrent_jobs = 4;
+        config.workers.file_io_concurrency = 2;
+        config.workers.provider_request_concurrency = 3;
+        config.workers.db_write_concurrency = 1;
+        config.server.bind_address = "0.0.0.0:8080".to_string();
+        config.api.base_path = "/api/v1".to_string();
+        config.web.mount_path = "/ui".to_string();
+        config.web.asset_dir = PathBuf::from("/srv/discern/web");
+        config
+    }
+
     #[test]
     fn default_config_is_valid() {
         assert_eq!(AppConfig::default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn representative_config_fixture_is_valid() {
+        let config = representative_config_fixture();
+
+        assert_eq!(config.validate(), Ok(()));
+        assert_eq!(config.validate_startup(), Ok(()));
+    }
+
+    #[test]
+    fn startup_validation_reports_multiple_policy_collisions_from_fixture() {
+        let mut config = representative_config_fixture();
+        config.import.duplicate_policy = DuplicatePolicy::AllowIfDistinguishable;
+        config.export.profiles[0].edition_visibility = EditionVisibilityPolicy::Hidden;
+        config.export.profiles[0].provenance_visibility = VariantVisibilityPolicy::Hidden;
+        config.export.path_templates.release_instance_template =
+            "{release_year}/{format_family}-{bitrate_mode}".to_string();
+        config.providers.discogs.personal_access_token = None;
+        config.workers.db_write_concurrency = 2;
+
+        assert_eq!(
+            config.validate_startup(),
+            Err(ConfigValidationReport {
+                errors: vec![
+                    ConfigValidationIssue {
+                        field: "providers.discogs.personal_access_token".to_string(),
+                        message: "discogs requires a personal access token when enabled".to_string(),
+                    },
+                    ConfigValidationIssue {
+                        field: "workers.db_write_concurrency".to_string(),
+                        message: "SQLite runtime requires a single DB write worker".to_string(),
+                    },
+                    ConfigValidationIssue {
+                        field: "export.profiles[generic_player].edition_visibility".to_string(),
+                        message: "edition visibility is hidden, but no path template includes {edition_label}".to_string(),
+                    },
+                    ConfigValidationIssue {
+                        field: "export.profiles[generic_player].provenance_visibility".to_string(),
+                        message: "duplicate coexistence requires {source_name} in the release instance path when provenance is hidden from tags".to_string(),
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn validation_returns_first_schema_error_before_startup_checks() {
+        let mut config = representative_config_fixture();
+        config.api.base_path = "api".to_string();
+        config.providers.discogs.personal_access_token = None;
+
+        assert_eq!(
+            config.validate_startup(),
+            Err(ConfigValidationReport {
+                errors: vec![
+                    ConfigValidationIssue {
+                        field: "api.base_path".to_string(),
+                        message: "path must start with '/'".to_string(),
+                    },
+                    ConfigValidationIssue {
+                        field: "providers.discogs.personal_access_token".to_string(),
+                        message: "discogs requires a personal access token when enabled"
+                            .to_string(),
+                    },
+                ],
+            })
+        );
     }
 
     #[test]
