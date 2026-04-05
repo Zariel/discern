@@ -3003,6 +3003,21 @@ mod tests {
         ) -> Result<Option<CandidateMatch>, RepositoryError> {
             unimplemented!("not needed in matching tests")
         }
+
+        fn list_track_instances_for_release_instance(
+            &self,
+            _release_instance_id: &ReleaseInstanceId,
+        ) -> Result<Vec<crate::domain::track_instance::TrackInstance>, RepositoryError> {
+            unimplemented!("not needed in matching tests")
+        }
+
+        fn list_files_for_release_instance(
+            &self,
+            _release_instance_id: &ReleaseInstanceId,
+            _role: Option<crate::domain::file::FileRole>,
+        ) -> Result<Vec<crate::domain::file::FileRecord>, RepositoryError> {
+            unimplemented!("not needed in matching tests")
+        }
     }
 
     impl ReleaseInstanceCommandRepository for InMemoryMatchingRepository {
@@ -3065,6 +3080,15 @@ mod tests {
                     .total_cmp(&left.normalized_score.value())
             });
             Ok(())
+        }
+
+        fn replace_track_instances_and_files(
+            &self,
+            _release_instance_id: &ReleaseInstanceId,
+            _track_instances: &[crate::domain::track_instance::TrackInstance],
+            _files: &[crate::domain::file::FileRecord],
+        ) -> Result<(), RepositoryError> {
+            unimplemented!("not needed in matching tests")
         }
     }
 

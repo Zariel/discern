@@ -1177,6 +1177,21 @@ mod tests {
         {
             Ok(None)
         }
+
+        fn list_track_instances_for_release_instance(
+            &self,
+            _release_instance_id: &ReleaseInstanceId,
+        ) -> Result<Vec<crate::domain::track_instance::TrackInstance>, RepositoryError> {
+            Ok(Vec::new())
+        }
+
+        fn list_files_for_release_instance(
+            &self,
+            _release_instance_id: &ReleaseInstanceId,
+            _role: Option<crate::domain::file::FileRole>,
+        ) -> Result<Vec<crate::domain::file::FileRecord>, RepositoryError> {
+            Ok(Vec::new())
+        }
     }
 
     impl ExportRepository for InMemoryTagRepository {

@@ -26,6 +26,7 @@ use crate::domain::candidate_match::{
 use crate::domain::exported_metadata_snapshot::{
     CompatibilityReport, ExportedMetadataSnapshot, QualifierVisibility,
 };
+use crate::domain::file::{FileRecord, FileRole};
 use crate::domain::import_batch::{BatchRequester, ImportBatch, ImportBatchStatus, ImportMode};
 use crate::domain::ingest_evidence::{
     IngestEvidenceRecord, IngestEvidenceSource, IngestEvidenceSubject, ObservedValue,
@@ -49,6 +50,7 @@ use crate::domain::staging_manifest::{
     ObservedTag, StagedFile, StagedReleaseGroup, StagingManifest, StagingManifestSource,
 };
 use crate::domain::track::{Track, TrackPosition};
+use crate::domain::track_instance::{AudioProperties, TrackInstance};
 use crate::support::ids::{
     ArtistId, CandidateMatchId, DiscogsReleaseId, ExportedMetadataSnapshotId, FileId,
     ImportBatchId, IngestEvidenceId, IssueId, JobId, ManualOverrideId, MetadataSnapshotId,
@@ -627,6 +629,60 @@ impl ReleaseInstanceRepository for SqliteRepositories {
             .optional()
             .map_err(to_storage_error)
     }
+
+    fn list_track_instances_for_release_instance(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+    ) -> Result<Vec<TrackInstance>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, release_instance_id, track_id, observed_disc_number,
+                        observed_track_number, observed_title, format_family,
+                        duration_ms, bitrate_kbps, sample_rate_hz, bit_depth
+                 FROM track_instances
+                 WHERE release_instance_id = ?1
+                 ORDER BY observed_disc_number ASC, observed_track_number ASC, id ASC",
+            )
+            .map_err(to_storage_error)?;
+        statement
+            .query_map(
+                params![release_instance_id.as_uuid().to_string()],
+                map_track_instance,
+            )
+            .map_err(to_storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_storage_error)
+    }
+
+    fn list_files_for_release_instance(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        role: Option<FileRole>,
+    ) -> Result<Vec<FileRecord>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        let role = role.as_ref().map(file_role_to_sql);
+        let mut statement = connection
+            .prepare(
+                "SELECT files.id, files.track_instance_id, files.role, files.format_family,
+                        files.path, files.checksum, files.size_bytes
+                 FROM files
+                 INNER JOIN track_instances
+                         ON track_instances.id = files.track_instance_id
+                 WHERE track_instances.release_instance_id = ?1
+                   AND (?2 IS NULL OR files.role = ?2)
+                 ORDER BY files.path ASC, files.id ASC",
+            )
+            .map_err(to_storage_error)?;
+        statement
+            .query_map(
+                params![release_instance_id.as_uuid().to_string(), role.as_deref()],
+                map_file_record,
+            )
+            .map_err(to_storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_storage_error)
+    }
 }
 
 impl ReleaseInstanceCommandRepository for SqliteRepositories {
@@ -805,6 +861,39 @@ impl ReleaseInstanceCommandRepository for SqliteRepositories {
                         ],
                     )
                     .map_err(to_storage_error)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn replace_track_instances_and_files(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        track_instances: &[TrackInstance],
+        files: &[FileRecord],
+    ) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "DELETE FROM files
+                     WHERE track_instance_id IN (
+                        SELECT id FROM track_instances WHERE release_instance_id = ?1
+                     )",
+                    params![release_instance_id.as_uuid().to_string()],
+                )
+                .map_err(to_storage_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM track_instances
+                     WHERE release_instance_id = ?1",
+                    params![release_instance_id.as_uuid().to_string()],
+                )
+                .map_err(to_storage_error)?;
+            for track_instance in track_instances {
+                write_track_instance(transaction, track_instance)?;
+            }
+            for file in files {
+                write_file_record(transaction, file)?;
             }
             Ok(())
         })
@@ -1900,6 +1989,26 @@ fn map_release_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReleaseInst
     })
 }
 
+fn map_track_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrackInstance> {
+    Ok(TrackInstance {
+        id: parse_uuid_id::<TrackInstanceId>(row.get_ref(0)?, 0)?,
+        release_instance_id: parse_uuid_id::<ReleaseInstanceId>(row.get_ref(1)?, 1)?,
+        track_id: parse_uuid_id::<TrackId>(row.get_ref(2)?, 2)?,
+        observed_position: TrackPosition {
+            disc_number: row.get::<_, i64>(3)? as u16,
+            track_number: row.get::<_, i64>(4)? as u16,
+        },
+        observed_title: row.get(5)?,
+        audio_properties: AudioProperties {
+            format_family: parse_format_family(row.get::<_, String>(6)?),
+            duration_ms: row.get::<_, Option<i64>>(7)?.map(|value| value as u32),
+            bitrate_kbps: row.get::<_, Option<i64>>(8)?.map(|value| value as u32),
+            sample_rate_hz: row.get::<_, Option<i64>>(9)?.map(|value| value as u32),
+            bit_depth: row.get::<_, Option<i64>>(10)?.map(|value| value as u8),
+        },
+    })
+}
+
 fn map_track(row: &rusqlite::Row<'_>) -> rusqlite::Result<Track> {
     Ok(Track {
         id: parse_uuid_id::<TrackId>(row.get_ref(0)?, 0)?,
@@ -1916,6 +2025,18 @@ fn map_track(row: &rusqlite::Row<'_>) -> rusqlite::Result<Track> {
             .transpose()
             .map_err(|error| invalid_column(5, error.to_string()))?,
         duration_ms: row.get::<_, Option<i64>>(6)?.map(|value| value as u32),
+    })
+}
+
+fn map_file_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
+    Ok(FileRecord {
+        id: parse_uuid_id::<FileId>(row.get_ref(0)?, 0)?,
+        track_instance_id: parse_uuid_id::<TrackInstanceId>(row.get_ref(1)?, 1)?,
+        role: parse_file_role(row.get::<_, String>(2)?),
+        format_family: parse_format_family(row.get::<_, String>(3)?),
+        path: PathBuf::from(row.get::<_, String>(4)?),
+        checksum: row.get(5)?,
+        size_bytes: row.get::<_, i64>(6)? as u64,
     })
 }
 
@@ -2153,6 +2274,61 @@ fn write_release_instance(
     Ok(())
 }
 
+fn write_track_instance(
+    transaction: &Transaction<'_>,
+    track_instance: &TrackInstance,
+) -> Result<(), RepositoryError> {
+    transaction
+        .execute(
+            "INSERT INTO track_instances
+             (id, release_instance_id, track_id, observed_disc_number,
+              observed_track_number, observed_title, format_family, duration_ms,
+              bitrate_kbps, sample_rate_hz, bit_depth)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                track_instance.id.as_uuid().to_string(),
+                track_instance.release_instance_id.as_uuid().to_string(),
+                track_instance.track_id.as_uuid().to_string(),
+                i64::from(track_instance.observed_position.disc_number),
+                i64::from(track_instance.observed_position.track_number),
+                &track_instance.observed_title,
+                format_family_to_sql(&track_instance.audio_properties.format_family),
+                track_instance.audio_properties.duration_ms.map(i64::from),
+                track_instance.audio_properties.bitrate_kbps.map(i64::from),
+                track_instance
+                    .audio_properties
+                    .sample_rate_hz
+                    .map(i64::from),
+                track_instance.audio_properties.bit_depth.map(i64::from),
+            ],
+        )
+        .map_err(to_storage_error)?;
+    Ok(())
+}
+
+fn write_file_record(
+    transaction: &Transaction<'_>,
+    file: &FileRecord,
+) -> Result<(), RepositoryError> {
+    transaction
+        .execute(
+            "INSERT INTO files
+             (id, track_instance_id, role, format_family, path, checksum, size_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                file.id.as_uuid().to_string(),
+                file.track_instance_id.as_uuid().to_string(),
+                file_role_to_sql(&file.role),
+                format_family_to_sql(&file.format_family),
+                file.path.to_string_lossy().to_string(),
+                &file.checksum,
+                file.size_bytes as i64,
+            ],
+        )
+        .map_err(to_storage_error)?;
+    Ok(())
+}
+
 fn parse_uuid_id<T>(value: rusqlite::types::ValueRef<'_>, column: usize) -> rusqlite::Result<T>
 where
     T: ParseUuidId,
@@ -2283,6 +2459,21 @@ fn format_family_to_sql(value: &FormatFamily) -> String {
     match value {
         FormatFamily::Flac => "flac",
         FormatFamily::Mp3 => "mp3",
+    }
+    .to_string()
+}
+
+fn parse_file_role(value: String) -> FileRole {
+    match value.as_str() {
+        "source" => FileRole::Source,
+        _ => FileRole::Managed,
+    }
+}
+
+fn file_role_to_sql(value: &FileRole) -> String {
+    match value {
+        FileRole::Source => "source",
+        FileRole::Managed => "managed",
     }
     .to_string()
 }
@@ -3367,6 +3558,7 @@ mod tests {
         CandidateMatch, CandidateProvider, CandidateScore, CandidateSubject, EvidenceKind,
         EvidenceNote, ProviderProvenance,
     };
+    use crate::domain::file::{FileRecord, FileRole};
     use crate::domain::issue::{IssueState, IssueSubject, IssueType};
     use crate::domain::job::{JobStatus, JobSubject, JobTrigger, JobType};
     use crate::domain::manual_override::{ManualOverride, OverrideField, OverrideSubject};
@@ -3377,6 +3569,7 @@ mod tests {
         BitrateMode, FormatFamily, IngestOrigin, ProvenanceSnapshot, ReleaseInstance,
         ReleaseInstanceState, TechnicalVariant,
     };
+    use crate::domain::track_instance::{AudioProperties, TrackInstance};
     use id3::TagLike;
     use uuid::Uuid;
 
@@ -3558,6 +3751,69 @@ mod tests {
         assert_eq!(tracks[0].title, "15 Step");
         assert_eq!(tracks[1].position.track_number, 2);
         assert_eq!(tracks[1].title, "Bodysnatchers");
+    }
+
+    #[test]
+    fn repositories_replace_track_instances_and_managed_files() {
+        let (context, _path) = seeded_context();
+        let repositories = SqliteRepositories::new(context);
+        let release_instance_id: ReleaseInstanceId = parse_uuid(SeedIds::RELEASE_INSTANCE);
+        let track_one_id: TrackId = parse_uuid(SeedIds::TRACK_ONE);
+        let track_instance = TrackInstance {
+            id: TrackInstanceId::new(),
+            release_instance_id: release_instance_id.clone(),
+            track_id: track_one_id,
+            observed_position: TrackPosition {
+                disc_number: 1,
+                track_number: 1,
+            },
+            observed_title: Some("15 Step".to_string()),
+            audio_properties: AudioProperties {
+                format_family: FormatFamily::Flac,
+                duration_ms: Some(237_000),
+                bitrate_kbps: None,
+                sample_rate_hz: Some(44_100),
+                bit_depth: Some(16),
+            },
+        };
+        let source_file = FileRecord {
+            id: FileId::new(),
+            track_instance_id: track_instance.id.clone(),
+            role: FileRole::Source,
+            format_family: FormatFamily::Flac,
+            path: PathBuf::from("/incoming/radiohead/In Rainbows/01 - 15 Step.flac"),
+            checksum: None,
+            size_bytes: 1024,
+        };
+        let managed_file = FileRecord {
+            id: FileId::new(),
+            track_instance_id: track_instance.id.clone(),
+            role: FileRole::Managed,
+            format_family: FormatFamily::Flac,
+            path: PathBuf::from(
+                "/library/Radiohead/In Rainbows/2007 - 2007 CD/FLAC-lossless-na-44100-16/Incoming/01 - 15 Step.flac",
+            ),
+            checksum: None,
+            size_bytes: 1024,
+        };
+
+        repositories
+            .replace_track_instances_and_files(
+                &release_instance_id,
+                std::slice::from_ref(&track_instance),
+                &[source_file.clone(), managed_file.clone()],
+            )
+            .expect("track instances and files should persist");
+
+        let stored_track_instances = repositories
+            .list_track_instances_for_release_instance(&release_instance_id)
+            .expect("track instances should load");
+        assert_eq!(stored_track_instances, vec![track_instance]);
+
+        let stored_managed_files = repositories
+            .list_files_for_release_instance(&release_instance_id, Some(FileRole::Managed))
+            .expect("managed files should load");
+        assert_eq!(stored_managed_files, vec![managed_file]);
     }
 
     #[test]

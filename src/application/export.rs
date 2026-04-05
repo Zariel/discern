@@ -521,6 +521,21 @@ mod tests {
         {
             unimplemented!("not needed in export tests")
         }
+
+        fn list_track_instances_for_release_instance(
+            &self,
+            _release_instance_id: &ReleaseInstanceId,
+        ) -> Result<Vec<crate::domain::track_instance::TrackInstance>, RepositoryError> {
+            unimplemented!("not needed in export tests")
+        }
+
+        fn list_files_for_release_instance(
+            &self,
+            _release_instance_id: &ReleaseInstanceId,
+            _role: Option<crate::domain::file::FileRole>,
+        ) -> Result<Vec<crate::domain::file::FileRecord>, RepositoryError> {
+            unimplemented!("not needed in export tests")
+        }
     }
 
     impl ReleaseRepository for InMemoryExportRepository {

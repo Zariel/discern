@@ -1,6 +1,7 @@
 use crate::domain::artist::Artist;
 use crate::domain::candidate_match::CandidateMatch;
 use crate::domain::exported_metadata_snapshot::ExportedMetadataSnapshot;
+use crate::domain::file::{FileRecord, FileRole};
 use crate::domain::import_batch::ImportBatch;
 use crate::domain::ingest_evidence::IngestEvidenceRecord;
 use crate::domain::issue::{Issue, IssueState, IssueSubject, IssueType};
@@ -13,6 +14,7 @@ use crate::domain::release_instance::{FormatFamily, ReleaseInstance, ReleaseInst
 use crate::domain::source::{Source, SourceLocator};
 use crate::domain::staging_manifest::StagingManifest;
 use crate::domain::track::Track;
+use crate::domain::track_instance::TrackInstance;
 use crate::support::ids::{
     CandidateMatchId, ExportedMetadataSnapshotId, ImportBatchId, IssueId, JobId, ManualOverrideId,
     ReleaseGroupId, ReleaseId, ReleaseInstanceId,
@@ -103,6 +105,17 @@ pub trait ReleaseInstanceRepository {
         &self,
         id: &CandidateMatchId,
     ) -> Result<Option<CandidateMatch>, RepositoryError>;
+
+    fn list_track_instances_for_release_instance(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+    ) -> Result<Vec<TrackInstance>, RepositoryError>;
+
+    fn list_files_for_release_instance(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        role: Option<FileRole>,
+    ) -> Result<Vec<FileRecord>, RepositoryError>;
 }
 
 pub trait ReleaseInstanceCommandRepository {
@@ -127,6 +140,13 @@ pub trait ReleaseInstanceCommandRepository {
         release_instance_id: &ReleaseInstanceId,
         provider: &crate::domain::candidate_match::CandidateProvider,
         matches: &[CandidateMatch],
+    ) -> Result<(), RepositoryError>;
+
+    fn replace_track_instances_and_files(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        track_instances: &[TrackInstance],
+        files: &[FileRecord],
     ) -> Result<(), RepositoryError>;
 }
 
