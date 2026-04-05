@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use crate::application::repository::{
     ImportBatchRepository, IngestEvidenceRepository, IssueCommandRepository, IssueListQuery,
-    IssueRepository, MetadataSnapshotCommandRepository, ReleaseCommandRepository,
+    IssueRepository, ManualOverrideCommandRepository, ManualOverrideListQuery,
+    ManualOverrideRepository, MetadataSnapshotCommandRepository, ReleaseCommandRepository,
     ReleaseInstanceCommandRepository, ReleaseInstanceRepository, ReleaseRepository,
     RepositoryError, RepositoryErrorKind, SourceRepository, StagingManifestRepository,
 };
@@ -18,6 +19,7 @@ use crate::domain::ingest_evidence::{
     IngestEvidenceRecord, IngestEvidenceSubject, ObservedValueKind,
 };
 use crate::domain::issue::{Issue, IssueState, IssueSubject, IssueType};
+use crate::domain::manual_override::{ManualOverride, OverrideField, OverrideSubject};
 use crate::domain::metadata_snapshot::{
     MetadataSnapshot, MetadataSnapshotSource, MetadataSubject, SnapshotFormat,
 };
@@ -304,6 +306,8 @@ where
         + IngestEvidenceRepository
         + IssueCommandRepository
         + IssueRepository
+        + ManualOverrideCommandRepository
+        + ManualOverrideRepository
         + MetadataSnapshotCommandRepository
         + ReleaseCommandRepository
         + ReleaseInstanceCommandRepository
@@ -388,17 +392,9 @@ where
                 .map_err(map_repository_error)?;
 
             let mut updated_instance = release_instance.clone();
-            updated_instance.state = if needs_review(&persisted_candidates) {
-                ReleaseInstanceState::NeedsReview
-            } else {
-                ReleaseInstanceState::Analyzed
-            };
-            self.repository
-                .update_release_instance(&updated_instance)
-                .map_err(map_repository_error)?;
-            synchronize_review_issues(
+            apply_match_outcome(
                 &self.repository,
-                &updated_instance,
+                &mut updated_instance,
                 &persisted_candidates,
                 persisted_at_unix_seconds,
             )?;
@@ -473,6 +469,59 @@ where
             batch_id: batch_id.clone(),
             groups,
         })
+    }
+
+    pub fn apply_manual_release_override(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        release_id: &crate::support::ids::ReleaseId,
+        created_by: &str,
+        note: Option<String>,
+        created_at_unix_seconds: i64,
+    ) -> Result<ReleaseInstance, MatchingServiceError> {
+        let mut release_instance = self
+            .repository
+            .get_release_instance(release_instance_id)
+            .map_err(map_repository_error)?
+            .ok_or_else(|| MatchingServiceError {
+                kind: MatchingServiceErrorKind::NotFound,
+                message: format!(
+                    "no release instance found for {}",
+                    release_instance_id.as_uuid()
+                ),
+            })?;
+        self.repository
+            .get_release(release_id)
+            .map_err(map_repository_error)?
+            .ok_or_else(|| MatchingServiceError {
+                kind: MatchingServiceErrorKind::NotFound,
+                message: format!("no release found for {}", release_id.as_uuid()),
+            })?;
+
+        let override_record = ManualOverride {
+            id: crate::support::ids::ManualOverrideId::new(),
+            subject: OverrideSubject::ReleaseInstance(release_instance.id.clone()),
+            field: OverrideField::ReleaseMatch,
+            value: release_id.as_uuid().to_string(),
+            note,
+            created_by: created_by.to_string(),
+            created_at_unix_seconds,
+        };
+        self.repository
+            .create_manual_override(&override_record)
+            .map_err(map_repository_error)?;
+
+        release_instance.release_id = Some(release_id.clone());
+        release_instance.state = ReleaseInstanceState::Matched;
+        self.repository
+            .update_release_instance(&release_instance)
+            .map_err(map_repository_error)?;
+        resolve_review_issues_for_subject(
+            &self.repository,
+            &IssueSubject::ReleaseInstance(release_instance.id.clone()),
+            created_at_unix_seconds,
+        )?;
+        Ok(release_instance)
     }
 
     pub async fn enrich_release_instance_with_discogs(
@@ -1410,6 +1459,102 @@ where
     Ok(())
 }
 
+fn apply_match_outcome<R>(
+    repository: &R,
+    release_instance: &mut ReleaseInstance,
+    candidates: &[CandidateMatch],
+    changed_at_unix_seconds: i64,
+) -> Result<(), MatchingServiceError>
+where
+    R: IssueCommandRepository
+        + IssueRepository
+        + ManualOverrideRepository
+        + ReleaseInstanceCommandRepository,
+{
+    if let Some(release_id) = latest_manual_release_override(repository, &release_instance.id)? {
+        release_instance.release_id = Some(release_id);
+        release_instance.state = ReleaseInstanceState::Matched;
+        repository
+            .update_release_instance(release_instance)
+            .map_err(map_repository_error)?;
+        resolve_review_issues_for_subject(
+            repository,
+            &IssueSubject::ReleaseInstance(release_instance.id.clone()),
+            changed_at_unix_seconds,
+        )?;
+        return Ok(());
+    }
+
+    release_instance.state = if needs_review(candidates) {
+        ReleaseInstanceState::NeedsReview
+    } else {
+        ReleaseInstanceState::Analyzed
+    };
+    repository
+        .update_release_instance(release_instance)
+        .map_err(map_repository_error)?;
+    synchronize_review_issues(
+        repository,
+        release_instance,
+        candidates,
+        changed_at_unix_seconds,
+    )
+}
+
+fn latest_manual_release_override<R>(
+    repository: &R,
+    release_instance_id: &ReleaseInstanceId,
+) -> Result<Option<crate::support::ids::ReleaseId>, MatchingServiceError>
+where
+    R: ManualOverrideRepository,
+{
+    let overrides = repository
+        .list_manual_overrides(&ManualOverrideListQuery {
+            subject: Some(OverrideSubject::ReleaseInstance(
+                release_instance_id.clone(),
+            )),
+            field: Some(OverrideField::ReleaseMatch),
+            page: PageRequest::new(1, 0),
+        })
+        .map_err(map_repository_error)?;
+    let Some(latest) = overrides.items.first() else {
+        return Ok(None);
+    };
+    Ok(crate::support::ids::ReleaseId::parse_str(&latest.value).ok())
+}
+
+fn resolve_review_issues_for_subject<R>(
+    repository: &R,
+    subject: &IssueSubject,
+    changed_at_unix_seconds: i64,
+) -> Result<(), MatchingServiceError>
+where
+    R: IssueCommandRepository + IssueRepository,
+{
+    for issue_type in [
+        IssueType::UnmatchedRelease,
+        IssueType::AmbiguousReleaseMatch,
+    ] {
+        let existing = repository
+            .list_issues(&IssueListQuery {
+                state: Some(IssueState::Open),
+                issue_type: Some(issue_type),
+                subject: Some(subject.clone()),
+                page: PageRequest::new(20, 0),
+            })
+            .map_err(map_repository_error)?;
+        for mut issue in existing.items {
+            issue
+                .resolve(changed_at_unix_seconds)
+                .map_err(map_issue_lifecycle_error)?;
+            repository
+                .update_issue(&issue)
+                .map_err(map_repository_error)?;
+        }
+    }
+    Ok(())
+}
+
 fn build_review_issue_content(
     release_instance: &ReleaseInstance,
     candidates: &[CandidateMatch],
@@ -1842,6 +1987,7 @@ mod tests {
 
     use crate::application::repository::{
         ImportBatchRepository, IssueCommandRepository, IssueListQuery, IssueRepository,
+        ManualOverrideCommandRepository, ManualOverrideListQuery, ManualOverrideRepository,
         MetadataSnapshotCommandRepository, ReleaseCommandRepository,
         ReleaseInstanceCommandRepository, ReleaseInstanceRepository, ReleaseRepository,
         SourceRepository,
@@ -1853,6 +1999,7 @@ mod tests {
         IngestEvidenceRecord, IngestEvidenceSource, IngestEvidenceSubject, ObservedValue,
     };
     use crate::domain::issue::{Issue, IssueState, IssueSubject, IssueType};
+    use crate::domain::manual_override::{ManualOverride, OverrideField};
     use crate::domain::release_instance::{ReleaseInstance, ReleaseInstanceState};
     use crate::domain::source::{Source, SourceKind, SourceLocator};
     use crate::domain::staging_manifest::{
@@ -2159,6 +2306,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_release_override_resolves_unmatched_and_survives_rescoring() {
+        let batch_id = ImportBatchId::new();
+        let repository = InMemoryMatchingRepository::with_batch(batch_id.clone());
+        let weak_provider =
+            FakeMusicBrainzProvider::with_release_candidates(vec![MusicBrainzReleaseCandidate {
+                id: "release-weak".to_string(),
+                title: "Kid A Tribute".to_string(),
+                score: 40,
+                artist_names: vec!["Various Artists".to_string()],
+                release_group_id: Some("group-weak".to_string()),
+                release_group_title: Some("Kid A Tribute".to_string()),
+                country: Some("US".to_string()),
+                date: Some("2001-01-01".to_string()),
+                track_count: Some(14),
+            }]);
+        let service = ReleaseMatchingService::new(repository.clone(), weak_provider.clone());
+        let release = seed_manual_release(&repository);
+
+        let scored = service
+            .score_and_persist_batch_matches(&batch_id, 200)
+            .await
+            .expect("scoring should succeed");
+        let release_instance_id = scored.groups[0].release_instance.id.clone();
+        let overridden = service
+            .apply_manual_release_override(
+                &release_instance_id,
+                &release.id,
+                "operator",
+                Some("confirmed manually".to_string()),
+                210,
+            )
+            .expect("manual override should apply");
+        assert_eq!(overridden.state, ReleaseInstanceState::Matched);
+        assert_eq!(overridden.release_id, Some(release.id.clone()));
+        assert!(
+            repository
+                .stored_manual_overrides()
+                .iter()
+                .any(|item| item.field == OverrideField::ReleaseMatch)
+        );
+
+        let rescored = ReleaseMatchingService::new(repository.clone(), weak_provider)
+            .score_and_persist_batch_matches(&batch_id, 220)
+            .await
+            .expect("rescoring should succeed");
+        assert_eq!(
+            rescored.groups[0].release_instance.state,
+            ReleaseInstanceState::Matched
+        );
+        assert_eq!(
+            rescored.groups[0].release_instance.release_id,
+            Some(release.id)
+        );
+        assert!(
+            repository
+                .issues_for(
+                    IssueSubject::ReleaseInstance(release_instance_id),
+                    IssueType::UnmatchedRelease,
+                )
+                .iter()
+                .all(|issue| issue.state != IssueState::Open)
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_release_override_resolves_ambiguous_and_survives_rescoring() {
+        let batch_id = ImportBatchId::new();
+        let repository = InMemoryMatchingRepository::with_batch(batch_id.clone());
+        let ambiguous_provider = FakeMusicBrainzProvider::with_release_candidates(vec![
+            MusicBrainzReleaseCandidate {
+                id: "release-strong".to_string(),
+                title: "Kid A".to_string(),
+                score: 96,
+                artist_names: vec!["Radiohead".to_string()],
+                release_group_id: Some("group-1".to_string()),
+                release_group_title: Some("Kid A".to_string()),
+                country: Some("GB".to_string()),
+                date: Some("2000-10-02".to_string()),
+                track_count: Some(1),
+            },
+            MusicBrainzReleaseCandidate {
+                id: "release-near".to_string(),
+                title: "Kid A".to_string(),
+                score: 94,
+                artist_names: vec!["Radiohead".to_string()],
+                release_group_id: Some("group-2".to_string()),
+                release_group_title: Some("Kid A".to_string()),
+                country: Some("GB".to_string()),
+                date: Some("2000-10-03".to_string()),
+                track_count: Some(1),
+            },
+        ]);
+        let service = ReleaseMatchingService::new(repository.clone(), ambiguous_provider.clone());
+        let release = seed_manual_release(&repository);
+
+        let scored = service
+            .score_and_persist_batch_matches(&batch_id, 230)
+            .await
+            .expect("scoring should succeed");
+        let release_instance_id = scored.groups[0].release_instance.id.clone();
+        service
+            .apply_manual_release_override(&release_instance_id, &release.id, "operator", None, 240)
+            .expect("manual override should apply");
+
+        let rescored = ReleaseMatchingService::new(repository.clone(), ambiguous_provider)
+            .score_and_persist_batch_matches(&batch_id, 250)
+            .await
+            .expect("rescoring should succeed");
+        assert_eq!(
+            rescored.groups[0].release_instance.state,
+            ReleaseInstanceState::Matched
+        );
+        assert_eq!(
+            rescored.groups[0].release_instance.release_id,
+            Some(release.id)
+        );
+        assert!(
+            repository
+                .issues_for(
+                    IssueSubject::ReleaseInstance(release_instance_id),
+                    IssueType::AmbiguousReleaseMatch,
+                )
+                .iter()
+                .all(|issue| issue.state != IssueState::Open)
+        );
+    }
+
+    #[tokio::test]
     async fn discogs_enrichment_persists_payloads_without_overriding_identity() {
         let batch_id = ImportBatchId::new();
         let repository = InMemoryMatchingRepository::with_batch(batch_id.clone());
@@ -2326,6 +2601,7 @@ mod tests {
         candidate_matches: Arc<Mutex<HashMap<ReleaseInstanceId, Vec<CandidateMatch>>>>,
         metadata_snapshots: Arc<Mutex<Vec<MetadataSnapshot>>>,
         issues: Arc<Mutex<Vec<Issue>>>,
+        manual_overrides: Arc<Mutex<Vec<ManualOverride>>>,
     }
 
     impl InMemoryMatchingRepository {
@@ -2405,6 +2681,7 @@ mod tests {
                 candidate_matches: Arc::new(Mutex::new(HashMap::new())),
                 metadata_snapshots: Arc::new(Mutex::new(Vec::new())),
                 issues: Arc::new(Mutex::new(Vec::new())),
+                manual_overrides: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2460,6 +2737,13 @@ mod tests {
 
         fn stored_releases(&self) -> Vec<Release> {
             self.releases.lock().expect("releases should lock").clone()
+        }
+
+        fn stored_manual_overrides(&self) -> Vec<ManualOverride> {
+            self.manual_overrides
+                .lock()
+                .expect("manual overrides should lock")
+                .clone()
         }
     }
 
@@ -2866,6 +3150,74 @@ mod tests {
         }
     }
 
+    impl ManualOverrideRepository for InMemoryMatchingRepository {
+        fn get_manual_override(
+            &self,
+            id: &crate::support::ids::ManualOverrideId,
+        ) -> Result<Option<ManualOverride>, RepositoryError> {
+            Ok(self
+                .manual_overrides
+                .lock()
+                .expect("manual overrides should lock")
+                .iter()
+                .find(|override_record| override_record.id == *id)
+                .cloned())
+        }
+
+        fn list_manual_overrides(
+            &self,
+            query: &ManualOverrideListQuery,
+        ) -> Result<Page<ManualOverride>, RepositoryError> {
+            let mut items = self
+                .manual_overrides
+                .lock()
+                .expect("manual overrides should lock")
+                .iter()
+                .filter(|override_record| {
+                    query
+                        .subject
+                        .as_ref()
+                        .is_none_or(|subject| &override_record.subject == subject)
+                        && query
+                            .field
+                            .as_ref()
+                            .is_none_or(|field| &override_record.field == field)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            items.sort_by(|left, right| {
+                right
+                    .created_at_unix_seconds
+                    .cmp(&left.created_at_unix_seconds)
+            });
+            let total = items.len() as u64;
+            let offset = (query.page.offset as usize).min(items.len());
+            let paged = items
+                .into_iter()
+                .skip(offset)
+                .take(query.page.limit as usize)
+                .collect();
+            Ok(Page {
+                items: paged,
+                request: query.page,
+                total,
+            })
+        }
+    }
+
+    impl ManualOverrideCommandRepository for InMemoryMatchingRepository {
+        fn create_manual_override(
+            &self,
+            override_record: &ManualOverride,
+        ) -> Result<(), RepositoryError> {
+            self.manual_overrides
+                .lock()
+                .expect("manual overrides should lock")
+                .push(override_record.clone());
+            Ok(())
+        }
+    }
+
     fn observed(kind: ObservedValueKind, value: &str) -> ObservedValue {
         ObservedValue {
             kind,
@@ -2905,5 +3257,40 @@ mod tests {
             structured_payload: Some("release_name: Kid A".to_string()),
             captured_at_unix_seconds: 1,
         }
+    }
+
+    fn seed_manual_release(repository: &InMemoryMatchingRepository) -> Release {
+        let artist = Artist {
+            id: crate::support::ids::ArtistId::new(),
+            name: "Radiohead".to_string(),
+            sort_name: Some("Radiohead".to_string()),
+            musicbrainz_artist_id: None,
+        };
+        repository
+            .create_artist(&artist)
+            .expect("artist should persist");
+        let release_group = ReleaseGroup {
+            id: crate::support::ids::ReleaseGroupId::new(),
+            primary_artist_id: artist.id.clone(),
+            title: "Kid A".to_string(),
+            kind: ReleaseGroupKind::Album,
+            musicbrainz_release_group_id: None,
+        };
+        repository
+            .create_release_group(&release_group)
+            .expect("release group should persist");
+        let release = Release {
+            id: crate::support::ids::ReleaseId::new(),
+            release_group_id: release_group.id,
+            primary_artist_id: artist.id,
+            title: "Kid A".to_string(),
+            musicbrainz_release_id: None,
+            discogs_release_id: None,
+            edition: ReleaseEdition::default(),
+        };
+        repository
+            .create_release(&release)
+            .expect("release should persist");
+        release
     }
 }

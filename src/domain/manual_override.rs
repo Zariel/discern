@@ -20,6 +20,7 @@ pub enum OverrideSubject {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverrideField {
+    ReleaseMatch,
     Title,
     AlbumArtist,
     ArtistCredit,

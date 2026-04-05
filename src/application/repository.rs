@@ -5,6 +5,7 @@ use crate::domain::import_batch::ImportBatch;
 use crate::domain::ingest_evidence::IngestEvidenceRecord;
 use crate::domain::issue::{Issue, IssueState, IssueSubject, IssueType};
 use crate::domain::job::{Job, JobStatus, JobType};
+use crate::domain::manual_override::{ManualOverride, OverrideField, OverrideSubject};
 use crate::domain::metadata_snapshot::MetadataSnapshot;
 use crate::domain::release::Release;
 use crate::domain::release_group::ReleaseGroup;
@@ -12,8 +13,8 @@ use crate::domain::release_instance::{FormatFamily, ReleaseInstance, ReleaseInst
 use crate::domain::source::{Source, SourceLocator};
 use crate::domain::staging_manifest::StagingManifest;
 use crate::support::ids::{
-    CandidateMatchId, ExportedMetadataSnapshotId, ImportBatchId, IssueId, JobId, ReleaseGroupId,
-    ReleaseId, ReleaseInstanceId,
+    CandidateMatchId, ExportedMetadataSnapshotId, ImportBatchId, IssueId, JobId, ManualOverrideId,
+    ReleaseGroupId, ReleaseId, ReleaseInstanceId,
 };
 use crate::support::pagination::{Page, PageRequest};
 
@@ -203,6 +204,25 @@ pub trait MetadataSnapshotCommandRepository {
     ) -> Result<(), RepositoryError>;
 }
 
+pub trait ManualOverrideRepository {
+    fn get_manual_override(
+        &self,
+        id: &ManualOverrideId,
+    ) -> Result<Option<ManualOverride>, RepositoryError>;
+
+    fn list_manual_overrides(
+        &self,
+        query: &ManualOverrideListQuery,
+    ) -> Result<Page<ManualOverride>, RepositoryError>;
+}
+
+pub trait ManualOverrideCommandRepository {
+    fn create_manual_override(
+        &self,
+        override_record: &ManualOverride,
+    ) -> Result<(), RepositoryError>;
+}
+
 pub trait IssueRepository {
     fn get_issue(&self, id: &IssueId) -> Result<Option<Issue>, RepositoryError>;
 
@@ -285,6 +305,13 @@ pub struct IssueListQuery {
 pub struct JobListQuery {
     pub status: Option<JobStatus>,
     pub job_type: Option<JobType>,
+    pub page: PageRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManualOverrideListQuery {
+    pub subject: Option<OverrideSubject>,
+    pub field: Option<OverrideField>,
     pub page: PageRequest,
 }
 

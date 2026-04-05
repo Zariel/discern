@@ -10,7 +10,8 @@ use crate::application::repository::{
     ExportRepository, ExportedMetadataListQuery, ImportBatchCommandRepository,
     ImportBatchListQuery, ImportBatchRepository, IngestEvidenceCommandRepository,
     IngestEvidenceRepository, IssueCommandRepository, IssueListQuery, IssueRepository,
-    JobCommandRepository, JobListQuery, JobRepository, MetadataSnapshotCommandRepository,
+    JobCommandRepository, JobListQuery, JobRepository, ManualOverrideCommandRepository,
+    ManualOverrideListQuery, ManualOverrideRepository, MetadataSnapshotCommandRepository,
     MetadataSnapshotRepository, ReleaseCommandRepository, ReleaseGroupSearchQuery,
     ReleaseInstanceCommandRepository, ReleaseInstanceListQuery, ReleaseInstanceRepository,
     ReleaseListQuery, ReleaseRepository, RepositoryError, RepositoryErrorKind,
@@ -32,6 +33,7 @@ use crate::domain::ingest_evidence::{
 };
 use crate::domain::issue::{Issue, IssueState, IssueSubject, IssueType};
 use crate::domain::job::{Job, JobStatus, JobSubject, JobTrigger, JobType};
+use crate::domain::manual_override::{ManualOverride, OverrideField, OverrideSubject};
 use crate::domain::metadata_snapshot::{
     MetadataSnapshot, MetadataSnapshotSource, MetadataSubject, SnapshotFormat,
 };
@@ -48,9 +50,9 @@ use crate::domain::staging_manifest::{
 };
 use crate::support::ids::{
     ArtistId, CandidateMatchId, DiscogsReleaseId, ExportedMetadataSnapshotId, FileId,
-    ImportBatchId, IngestEvidenceId, IssueId, JobId, MetadataSnapshotId, MusicBrainzReleaseGroupId,
-    MusicBrainzReleaseId, ReleaseGroupId, ReleaseId, ReleaseInstanceId, SourceId,
-    StagingManifestId, TrackInstanceId,
+    ImportBatchId, IngestEvidenceId, IssueId, JobId, ManualOverrideId, MetadataSnapshotId,
+    MusicBrainzReleaseGroupId, MusicBrainzReleaseId, ReleaseGroupId, ReleaseId, ReleaseInstanceId,
+    SourceId, StagingManifestId, TrackId, TrackInstanceId,
 };
 use crate::support::pagination::{Page, PageRequest};
 
@@ -1216,6 +1218,112 @@ impl MetadataSnapshotCommandRepository for SqliteRepositories {
     }
 }
 
+impl ManualOverrideRepository for SqliteRepositories {
+    fn get_manual_override(
+        &self,
+        id: &ManualOverrideId,
+    ) -> Result<Option<ManualOverride>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        connection
+            .query_row(
+                "SELECT id, subject_kind, subject_id, field, value, note,
+                        created_by, created_at_unix_seconds
+                 FROM manual_overrides
+                 WHERE id = ?1",
+                params![id.as_uuid().to_string()],
+                map_manual_override,
+            )
+            .optional()
+            .map_err(to_storage_error)
+    }
+
+    fn list_manual_overrides(
+        &self,
+        query: &ManualOverrideListQuery,
+    ) -> Result<Page<ManualOverride>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        let subject_kind = query
+            .subject
+            .as_ref()
+            .map(manual_override_subject_kind_to_sql);
+        let subject_id = query
+            .subject
+            .as_ref()
+            .map(manual_override_subject_id_to_sql);
+        let field = query.field.as_ref().map(manual_override_field_to_sql);
+        let total: i64 = connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM manual_overrides
+                 WHERE (?1 IS NULL OR subject_kind = ?1)
+                   AND (?2 IS NULL OR subject_id = ?2)
+                   AND (?3 IS NULL OR field = ?3)",
+                params![subject_kind, subject_id, field],
+                |row| row.get(0),
+            )
+            .map_err(to_storage_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, subject_kind, subject_id, field, value, note,
+                        created_by, created_at_unix_seconds
+                 FROM manual_overrides
+                 WHERE (?1 IS NULL OR subject_kind = ?1)
+                   AND (?2 IS NULL OR subject_id = ?2)
+                   AND (?3 IS NULL OR field = ?3)
+                 ORDER BY created_at_unix_seconds DESC
+                 LIMIT ?4 OFFSET ?5",
+            )
+            .map_err(to_storage_error)?;
+        let items = statement
+            .query_map(
+                params![
+                    subject_kind,
+                    subject_id,
+                    field,
+                    i64::from(query.page.limit),
+                    query.page.offset as i64,
+                ],
+                map_manual_override,
+            )
+            .map_err(to_storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_storage_error)?;
+        Ok(Page {
+            items,
+            request: query.page,
+            total: total as u64,
+        })
+    }
+}
+
+impl ManualOverrideCommandRepository for SqliteRepositories {
+    fn create_manual_override(
+        &self,
+        override_record: &ManualOverride,
+    ) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO manual_overrides
+                     (id, subject_kind, subject_id, field, value, note, created_by, created_at_unix_seconds)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        override_record.id.as_uuid().to_string(),
+                        manual_override_subject_kind_to_sql(&override_record.subject),
+                        manual_override_subject_id_to_sql(&override_record.subject),
+                        manual_override_field_to_sql(&override_record.field),
+                        &override_record.value,
+                        &override_record.note,
+                        &override_record.created_by,
+                        override_record.created_at_unix_seconds,
+                    ],
+                )
+                .map_err(to_storage_error)?;
+            Ok(())
+        })
+    }
+}
+
 impl IssueRepository for SqliteRepositories {
     fn get_issue(&self, id: &IssueId) -> Result<Option<Issue>, RepositoryError> {
         let connection = self.context.read_connection()?;
@@ -1987,12 +2095,14 @@ impl_parse_uuid_id!(
     IngestEvidenceId,
     IssueId,
     JobId,
+    ManualOverrideId,
     MetadataSnapshotId,
     ReleaseGroupId,
     ReleaseId,
     ReleaseInstanceId,
     SourceId,
     StagingManifestId,
+    TrackId,
     TrackInstanceId,
     MusicBrainzReleaseGroupId,
     MusicBrainzReleaseId
@@ -2917,6 +3027,82 @@ fn issue_subject_id_to_sql(subject: &IssueSubject) -> Option<String> {
     }
 }
 
+fn map_manual_override(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManualOverride> {
+    Ok(ManualOverride {
+        id: parse_uuid_id::<ManualOverrideId>(row.get_ref(0)?, 0)?,
+        subject: parse_manual_override_subject(row.get(1)?, row.get(2)?)?,
+        field: parse_manual_override_field(row.get(3)?),
+        value: row.get(4)?,
+        note: row.get(5)?,
+        created_by: row.get(6)?,
+        created_at_unix_seconds: row.get(7)?,
+    })
+}
+
+fn parse_manual_override_subject(
+    kind: String,
+    id: String,
+) -> Result<OverrideSubject, rusqlite::Error> {
+    match kind.as_str() {
+        "release" => Ok(OverrideSubject::Release(
+            ReleaseId::parse_str(&id).map_err(|error| invalid_column(2, error.to_string()))?,
+        )),
+        "release_instance" => Ok(OverrideSubject::ReleaseInstance(
+            ReleaseInstanceId::parse_str(&id)
+                .map_err(|error| invalid_column(2, error.to_string()))?,
+        )),
+        "track" => Ok(OverrideSubject::Track(
+            TrackId::parse_str(&id).map_err(|error| invalid_column(2, error.to_string()))?,
+        )),
+        other => Err(invalid_column(
+            1,
+            format!("unknown manual override subject kind '{other}'"),
+        )),
+    }
+}
+
+fn manual_override_subject_kind_to_sql(subject: &OverrideSubject) -> &'static str {
+    match subject {
+        OverrideSubject::Release(_) => "release",
+        OverrideSubject::ReleaseInstance(_) => "release_instance",
+        OverrideSubject::Track(_) => "track",
+    }
+}
+
+fn manual_override_subject_id_to_sql(subject: &OverrideSubject) -> String {
+    match subject {
+        OverrideSubject::Release(id) => id.as_uuid().to_string(),
+        OverrideSubject::ReleaseInstance(id) => id.as_uuid().to_string(),
+        OverrideSubject::Track(id) => id.as_uuid().to_string(),
+    }
+}
+
+fn parse_manual_override_field(value: String) -> OverrideField {
+    match value.as_str() {
+        "release_match" => OverrideField::ReleaseMatch,
+        "title" => OverrideField::Title,
+        "album_artist" => OverrideField::AlbumArtist,
+        "artist_credit" => OverrideField::ArtistCredit,
+        "track_title" => OverrideField::TrackTitle,
+        "release_date" => OverrideField::ReleaseDate,
+        "edition_qualifier" => OverrideField::EditionQualifier,
+        _ => OverrideField::ArtworkSelection,
+    }
+}
+
+fn manual_override_field_to_sql(field: &OverrideField) -> &'static str {
+    match field {
+        OverrideField::ReleaseMatch => "release_match",
+        OverrideField::Title => "title",
+        OverrideField::AlbumArtist => "album_artist",
+        OverrideField::ArtistCredit => "artist_credit",
+        OverrideField::TrackTitle => "track_title",
+        OverrideField::ReleaseDate => "release_date",
+        OverrideField::EditionQualifier => "edition_qualifier",
+        OverrideField::ArtworkSelection => "artwork_selection",
+    }
+}
+
 fn parse_job_type(value: String) -> JobType {
     match value.as_str() {
         "discover_batch" => JobType::DiscoverBatch,
@@ -3072,7 +3258,8 @@ mod tests {
     use crate::application::ingest::WatchDiscoveryService;
     use crate::application::repository::{
         ExportRepository, IngestEvidenceRepository, IssueRepository, JobCommandRepository,
-        JobRepository, MetadataSnapshotRepository, ReleaseCommandRepository,
+        JobRepository, ManualOverrideCommandRepository, ManualOverrideListQuery,
+        ManualOverrideRepository, MetadataSnapshotRepository, ReleaseCommandRepository,
         ReleaseInstanceCommandRepository, ReleaseInstanceRepository, ReleaseRepository,
         StagingManifestRepository,
     };
@@ -3083,6 +3270,7 @@ mod tests {
     };
     use crate::domain::issue::{IssueState, IssueSubject, IssueType};
     use crate::domain::job::{JobStatus, JobSubject, JobTrigger, JobType};
+    use crate::domain::manual_override::{ManualOverride, OverrideField, OverrideSubject};
     use crate::domain::metadata_snapshot::{MetadataSnapshotSource, SnapshotFormat};
     use crate::domain::release::{PartialDate, Release, ReleaseEdition};
     use crate::domain::release_group::{ReleaseGroup, ReleaseGroupKind};
@@ -3122,6 +3310,12 @@ mod tests {
         assert!(tables.contains(&"release_instances".to_string()));
         assert!(tables.contains(&"jobs".to_string()));
 
+        connection
+            .execute_batch(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/migrations/0004_manual_release_match_override.down.sql"
+            )))
+            .expect("manual override rollback should succeed");
         connection
             .execute_batch(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -3422,6 +3616,42 @@ mod tests {
             stored_release.edition.catalog_number.as_deref(),
             Some("WARPCD55")
         );
+    }
+
+    #[test]
+    fn repositories_persist_and_filter_manual_release_overrides() {
+        let (context, _path) = seeded_context();
+        let repositories = SqliteRepositories::new(context);
+        let override_record = ManualOverride {
+            id: ManualOverrideId::new(),
+            subject: OverrideSubject::ReleaseInstance(parse_uuid(SeedIds::RELEASE_INSTANCE)),
+            field: OverrideField::ReleaseMatch,
+            value: SeedIds::RELEASE.to_string(),
+            note: Some("chosen by operator".to_string()),
+            created_by: "operator".to_string(),
+            created_at_unix_seconds: 500,
+        };
+        repositories
+            .create_manual_override(&override_record)
+            .expect("manual override should persist");
+
+        let stored = repositories
+            .get_manual_override(&override_record.id)
+            .expect("lookup should succeed")
+            .expect("override should exist");
+        assert_eq!(stored.field, OverrideField::ReleaseMatch);
+
+        let listed = repositories
+            .list_manual_overrides(&ManualOverrideListQuery {
+                subject: Some(OverrideSubject::ReleaseInstance(parse_uuid(
+                    SeedIds::RELEASE_INSTANCE,
+                ))),
+                field: Some(OverrideField::ReleaseMatch),
+                page: PageRequest::new(10, 0),
+            })
+            .expect("query should succeed");
+        assert_eq!(listed.total, 1);
+        assert_eq!(listed.items[0].value, SeedIds::RELEASE);
     }
 
     #[test]
@@ -3895,6 +4125,12 @@ mod tests {
             .execute_batch(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/migrations/0003_analyzer_output.up.sql"
+            )))
+            .map_err(to_storage_error)?;
+        transaction
+            .execute_batch(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/migrations/0004_manual_release_match_override.up.sql"
             )))
             .map_err(to_storage_error)?;
         Ok(())
