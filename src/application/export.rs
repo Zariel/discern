@@ -650,6 +650,22 @@ mod tests {
                 .push(snapshot.clone());
             Ok(())
         }
+
+        fn update_exported_metadata_snapshot(
+            &self,
+            snapshot: &ExportedMetadataSnapshot,
+        ) -> Result<(), RepositoryError> {
+            let mut snapshots = self.snapshots.lock().expect("snapshots should lock");
+            let stored = snapshots
+                .iter_mut()
+                .find(|stored| stored.id == snapshot.id)
+                .ok_or_else(|| RepositoryError {
+                    kind: RepositoryErrorKind::NotFound,
+                    message: "snapshot not found".to_string(),
+                })?;
+            *stored = snapshot.clone();
+            Ok(())
+        }
     }
 
     impl ExportRepository for InMemoryExportRepository {

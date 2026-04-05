@@ -1892,6 +1892,78 @@ impl ExportCommandRepository for SqliteRepositories {
             Ok(())
         })
     }
+
+    fn update_exported_metadata_snapshot(
+        &self,
+        snapshot: &ExportedMetadataSnapshot,
+    ) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            let changed = transaction
+                .execute(
+                    "UPDATE exported_metadata_snapshots
+                     SET release_instance_id = ?2,
+                         export_profile = ?3,
+                         album_title = ?4,
+                         album_artist = ?5,
+                         artist_credits_json = ?6,
+                         edition_visibility = ?7,
+                         technical_visibility = ?8,
+                         path_components_json = ?9,
+                         primary_artwork_filename = ?10,
+                         compatibility_verified = ?11,
+                         compatibility_warnings_json = ?12,
+                         rendered_at_unix_seconds = ?13
+                     WHERE id = ?1",
+                    params![
+                        snapshot.id.as_uuid().to_string(),
+                        snapshot.release_instance_id.as_uuid().to_string(),
+                        &snapshot.export_profile,
+                        &snapshot.album_title,
+                        &snapshot.album_artist,
+                        serde_json::to_string(&snapshot.artist_credits).map_err(|error| {
+                            RepositoryError {
+                                kind: RepositoryErrorKind::Storage,
+                                message: format!(
+                                    "failed to encode exported artist credits: {error}"
+                                ),
+                            }
+                        })?,
+                        qualifier_visibility_to_sql(&snapshot.edition_visibility),
+                        qualifier_visibility_to_sql(&snapshot.technical_visibility),
+                        serde_json::to_string(&snapshot.path_components).map_err(|error| {
+                            RepositoryError {
+                                kind: RepositoryErrorKind::Storage,
+                                message: format!(
+                                    "failed to encode exported path components: {error}"
+                                ),
+                            }
+                        })?,
+                        &snapshot.primary_artwork_filename,
+                        snapshot.compatibility.verified,
+                        serde_json::to_string(&snapshot.compatibility.warnings).map_err(
+                            |error| RepositoryError {
+                                kind: RepositoryErrorKind::Storage,
+                                message: format!(
+                                    "failed to encode exported compatibility warnings: {error}"
+                                ),
+                            },
+                        )?,
+                        snapshot.rendered_at_unix_seconds,
+                    ],
+                )
+                .map_err(to_storage_error)?;
+            if changed == 0 {
+                return Err(RepositoryError {
+                    kind: RepositoryErrorKind::NotFound,
+                    message: format!(
+                        "exported metadata snapshot {} was not found",
+                        snapshot.id.as_uuid()
+                    ),
+                });
+            }
+            Ok(())
+        })
+    }
 }
 
 fn configure_connection(connection: &Connection) -> Result<(), RepositoryError> {
@@ -4011,7 +4083,7 @@ mod tests {
     fn repositories_persist_exported_metadata_snapshots() {
         let (context, _path) = seeded_context();
         let repositories = SqliteRepositories::new(context);
-        let snapshot = ExportedMetadataSnapshot {
+        let mut snapshot = ExportedMetadataSnapshot {
             id: ExportedMetadataSnapshotId::new(),
             release_instance_id: parse_uuid(SeedIds::RELEASE_INSTANCE),
             export_profile: "generic_player".to_string(),
@@ -4043,6 +4115,22 @@ mod tests {
         assert_eq!(
             stored.primary_artwork_filename,
             Some("cover.jpg".to_string())
+        );
+
+        snapshot.compatibility.verified = false;
+        snapshot.compatibility.warnings = vec!["player-visible collision detected".to_string()];
+        repositories
+            .update_exported_metadata_snapshot(&snapshot)
+            .expect("snapshot update should persist");
+
+        let updated = repositories
+            .get_exported_metadata(&snapshot.id)
+            .expect("lookup should succeed")
+            .expect("snapshot should exist");
+        assert!(!updated.compatibility.verified);
+        assert_eq!(
+            updated.compatibility.warnings,
+            vec!["player-visible collision detected".to_string()]
         );
     }
 

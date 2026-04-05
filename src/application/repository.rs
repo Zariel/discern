@@ -297,6 +297,11 @@ pub trait ExportCommandRepository {
         &self,
         snapshot: &ExportedMetadataSnapshot,
     ) -> Result<(), RepositoryError>;
+
+    fn update_exported_metadata_snapshot(
+        &self,
+        snapshot: &ExportedMetadataSnapshot,
+    ) -> Result<(), RepositoryError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
