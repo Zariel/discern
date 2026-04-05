@@ -1,9 +1,11 @@
-use crate::support::ids::{ReleaseId, ReleaseInstanceId};
+use crate::support::ids::{ImportBatchId, ReleaseId, ReleaseInstanceId, SourceId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseInstance {
     pub id: ReleaseInstanceId,
-    pub release_id: ReleaseId,
+    pub import_batch_id: ImportBatchId,
+    pub source_id: SourceId,
+    pub release_id: Option<ReleaseId>,
     pub state: ReleaseInstanceState,
     pub technical_variant: TechnicalVariant,
     pub provenance: ProvenanceSnapshot,

@@ -62,6 +62,11 @@ pub trait ReleaseInstanceRepository {
         query: &ReleaseInstanceListQuery,
     ) -> Result<Page<ReleaseInstance>, RepositoryError>;
 
+    fn list_release_instances_for_batch(
+        &self,
+        import_batch_id: &ImportBatchId,
+    ) -> Result<Vec<ReleaseInstance>, RepositoryError>;
+
     fn list_candidate_matches(
         &self,
         release_instance_id: &ReleaseInstanceId,
@@ -72,6 +77,24 @@ pub trait ReleaseInstanceRepository {
         &self,
         id: &CandidateMatchId,
     ) -> Result<Option<CandidateMatch>, RepositoryError>;
+}
+
+pub trait ReleaseInstanceCommandRepository {
+    fn create_release_instance(
+        &self,
+        release_instance: &ReleaseInstance,
+    ) -> Result<(), RepositoryError>;
+
+    fn update_release_instance(
+        &self,
+        release_instance: &ReleaseInstance,
+    ) -> Result<(), RepositoryError>;
+
+    fn replace_candidate_matches(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        matches: &[CandidateMatch],
+    ) -> Result<(), RepositoryError>;
 }
 
 pub trait ImportBatchRepository {

@@ -64,7 +64,8 @@ CREATE TABLE import_batch_paths (
 
 CREATE TABLE release_instances (
     id TEXT PRIMARY KEY,
-    release_id TEXT NOT NULL REFERENCES releases(id),
+    import_batch_id TEXT NOT NULL REFERENCES import_batches(id),
+    release_id TEXT REFERENCES releases(id),
     source_id TEXT NOT NULL REFERENCES sources(id),
     state TEXT NOT NULL CHECK (
         state IN (

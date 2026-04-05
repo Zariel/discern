@@ -11,9 +11,9 @@ use crate::application::repository::{
     ImportBatchListQuery, ImportBatchRepository, IngestEvidenceCommandRepository,
     IngestEvidenceRepository, IssueCommandRepository, IssueListQuery, IssueRepository,
     JobCommandRepository, JobListQuery, JobRepository, MetadataSnapshotCommandRepository,
-    MetadataSnapshotRepository, ReleaseGroupSearchQuery, ReleaseInstanceListQuery,
-    ReleaseInstanceRepository, ReleaseListQuery, ReleaseRepository, RepositoryError,
-    RepositoryErrorKind, SourceCommandRepository, SourceRepository,
+    MetadataSnapshotRepository, ReleaseGroupSearchQuery, ReleaseInstanceCommandRepository,
+    ReleaseInstanceListQuery, ReleaseInstanceRepository, ReleaseListQuery, ReleaseRepository,
+    RepositoryError, RepositoryErrorKind, SourceCommandRepository, SourceRepository,
     StagingManifestCommandRepository, StagingManifestRepository,
 };
 use crate::domain::candidate_match::{
@@ -298,7 +298,7 @@ impl ReleaseInstanceRepository for SqliteRepositories {
         let connection = self.context.read_connection()?;
         connection
             .query_row(
-                "SELECT id, release_id, state, format_family, bitrate_mode,
+                "SELECT id, import_batch_id, source_id, release_id, state, format_family, bitrate_mode,
                         bitrate_kbps, sample_rate_hz, bit_depth, track_count,
                         total_duration_seconds, ingest_origin, original_source_path,
                         imported_at_unix_seconds, gazelle_tracker, gazelle_torrent_id,
@@ -342,7 +342,7 @@ impl ReleaseInstanceRepository for SqliteRepositories {
 
         let mut statement = connection
             .prepare(
-                "SELECT id, release_id, state, format_family, bitrate_mode,
+                "SELECT id, import_batch_id, source_id, release_id, state, format_family, bitrate_mode,
                         bitrate_kbps, sample_rate_hz, bit_depth, track_count,
                         total_duration_seconds, ingest_origin, original_source_path,
                         imported_at_unix_seconds, gazelle_tracker, gazelle_torrent_id,
@@ -375,6 +375,33 @@ impl ReleaseInstanceRepository for SqliteRepositories {
             request: query.page,
             total: total as u64,
         })
+    }
+
+    fn list_release_instances_for_batch(
+        &self,
+        import_batch_id: &ImportBatchId,
+    ) -> Result<Vec<ReleaseInstance>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, import_batch_id, source_id, release_id, state, format_family, bitrate_mode,
+                        bitrate_kbps, sample_rate_hz, bit_depth, track_count,
+                        total_duration_seconds, ingest_origin, original_source_path,
+                        imported_at_unix_seconds, gazelle_tracker, gazelle_torrent_id,
+                        gazelle_release_group_id
+                 FROM release_instances
+                 WHERE import_batch_id = ?1
+                 ORDER BY imported_at_unix_seconds DESC, id ASC",
+            )
+            .map_err(to_storage_error)?;
+        statement
+            .query_map(
+                params![import_batch_id.as_uuid().to_string()],
+                map_release_instance,
+            )
+            .map_err(to_storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_storage_error)
     }
 
     fn list_candidate_matches(
@@ -442,6 +469,137 @@ impl ReleaseInstanceRepository for SqliteRepositories {
             )
             .optional()
             .map_err(to_storage_error)
+    }
+}
+
+impl ReleaseInstanceCommandRepository for SqliteRepositories {
+    fn create_release_instance(
+        &self,
+        release_instance: &ReleaseInstance,
+    ) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            write_release_instance(transaction, release_instance)?;
+            Ok(())
+        })
+    }
+
+    fn update_release_instance(
+        &self,
+        release_instance: &ReleaseInstance,
+    ) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "UPDATE release_instances
+                     SET import_batch_id = ?2,
+                         source_id = ?3,
+                         release_id = ?4,
+                         state = ?5,
+                         format_family = ?6,
+                         bitrate_mode = ?7,
+                         bitrate_kbps = ?8,
+                         sample_rate_hz = ?9,
+                         bit_depth = ?10,
+                         track_count = ?11,
+                         total_duration_seconds = ?12,
+                         ingest_origin = ?13,
+                         original_source_path = ?14,
+                         imported_at_unix_seconds = ?15,
+                         gazelle_tracker = ?16,
+                         gazelle_torrent_id = ?17,
+                         gazelle_release_group_id = ?18
+                     WHERE id = ?1",
+                    params![
+                        release_instance.id.as_uuid().to_string(),
+                        release_instance.import_batch_id.as_uuid().to_string(),
+                        release_instance.source_id.as_uuid().to_string(),
+                        release_instance
+                            .release_id
+                            .as_ref()
+                            .map(|value| value.as_uuid().to_string()),
+                        release_instance_state_to_sql(&release_instance.state),
+                        format_family_to_sql(&release_instance.technical_variant.format_family),
+                        bitrate_mode_to_sql(&release_instance.technical_variant.bitrate_mode),
+                        release_instance
+                            .technical_variant
+                            .bitrate_kbps
+                            .map(i64::from),
+                        release_instance
+                            .technical_variant
+                            .sample_rate_hz
+                            .map(i64::from),
+                        release_instance.technical_variant.bit_depth.map(i64::from),
+                        i64::from(release_instance.technical_variant.track_count),
+                        i64::from(release_instance.technical_variant.total_duration_seconds),
+                        ingest_origin_to_sql(&release_instance.provenance.ingest_origin),
+                        &release_instance.provenance.original_source_path,
+                        release_instance.provenance.imported_at_unix_seconds,
+                        release_instance
+                            .provenance
+                            .gazelle_reference
+                            .as_ref()
+                            .map(|value| value.tracker.clone()),
+                        release_instance
+                            .provenance
+                            .gazelle_reference
+                            .as_ref()
+                            .and_then(|value| value.torrent_id.clone()),
+                        release_instance
+                            .provenance
+                            .gazelle_reference
+                            .as_ref()
+                            .and_then(|value| value.release_group_id.clone()),
+                    ],
+                )
+                .map_err(to_storage_error)?;
+            Ok(())
+        })
+    }
+
+    fn replace_candidate_matches(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        matches: &[CandidateMatch],
+    ) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "DELETE FROM candidate_matches
+                     WHERE release_instance_id = ?1",
+                    params![release_instance_id.as_uuid().to_string()],
+                )
+                .map_err(to_storage_error)?;
+            for candidate_match in matches {
+                transaction
+                    .execute(
+                        "INSERT INTO candidate_matches
+                         (id, release_instance_id, provider, candidate_kind, provider_entity_id,
+                          normalized_score, evidence_matches_json, mismatches_json,
+                          unresolved_ambiguities_json, provider_provenance_json,
+                          created_at_unix_seconds)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        params![
+                            candidate_match.id.as_uuid().to_string(),
+                            candidate_match.release_instance_id.as_uuid().to_string(),
+                            candidate_provider_to_sql(&candidate_match.provider),
+                            candidate_subject_kind_to_sql(&candidate_match.subject),
+                            candidate_subject_id(&candidate_match.subject),
+                            f64::from(candidate_match.normalized_score.value()),
+                            serialize_evidence_notes(&candidate_match.evidence_matches)
+                                .map_err(storage_error)?,
+                            serialize_evidence_notes(&candidate_match.mismatches)
+                                .map_err(storage_error)?,
+                            serde_json::to_string(&candidate_match.unresolved_ambiguities)
+                                .map_err(|error| storage_error(error.to_string()))?,
+                            serialize_provider_provenance(&candidate_match.provider_provenance)
+                                .map_err(storage_error)?,
+                            candidate_match.provider_provenance.fetched_at_unix_seconds,
+                        ],
+                    )
+                    .map_err(to_storage_error)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1298,27 +1456,34 @@ fn map_release(row: &rusqlite::Row<'_>) -> rusqlite::Result<Release> {
 fn map_release_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReleaseInstance> {
     Ok(ReleaseInstance {
         id: parse_uuid_id::<ReleaseInstanceId>(row.get_ref(0)?, 0)?,
-        release_id: parse_uuid_id::<ReleaseId>(row.get_ref(1)?, 1)?,
-        state: parse_release_instance_state(row.get::<_, String>(2)?),
+        import_batch_id: parse_uuid_id::<ImportBatchId>(row.get_ref(1)?, 1)?,
+        source_id: parse_uuid_id::<SourceId>(row.get_ref(2)?, 2)?,
+        release_id: row
+            .get::<_, Option<String>>(3)?
+            .map(|value| {
+                ReleaseId::parse_str(&value).map_err(|error| invalid_column(3, error.to_string()))
+            })
+            .transpose()?,
+        state: parse_release_instance_state(row.get::<_, String>(4)?),
         technical_variant: TechnicalVariant {
-            format_family: parse_format_family(row.get::<_, String>(3)?),
-            bitrate_mode: parse_bitrate_mode(row.get::<_, String>(4)?),
-            bitrate_kbps: row.get::<_, Option<i64>>(5)?.map(|value| value as u32),
-            sample_rate_hz: row.get::<_, Option<i64>>(6)?.map(|value| value as u32),
-            bit_depth: row.get::<_, Option<i64>>(7)?.map(|value| value as u8),
-            track_count: row.get::<_, i64>(8)? as u16,
-            total_duration_seconds: row.get::<_, i64>(9)? as u32,
+            format_family: parse_format_family(row.get::<_, String>(5)?),
+            bitrate_mode: parse_bitrate_mode(row.get::<_, String>(6)?),
+            bitrate_kbps: row.get::<_, Option<i64>>(7)?.map(|value| value as u32),
+            sample_rate_hz: row.get::<_, Option<i64>>(8)?.map(|value| value as u32),
+            bit_depth: row.get::<_, Option<i64>>(9)?.map(|value| value as u8),
+            track_count: row.get::<_, i64>(10)? as u16,
+            total_duration_seconds: row.get::<_, i64>(11)? as u32,
         },
         provenance: ProvenanceSnapshot {
-            ingest_origin: parse_ingest_origin(row.get::<_, String>(10)?),
-            original_source_path: row.get(11)?,
-            imported_at_unix_seconds: row.get(12)?,
+            ingest_origin: parse_ingest_origin(row.get::<_, String>(12)?),
+            original_source_path: row.get(13)?,
+            imported_at_unix_seconds: row.get(14)?,
             gazelle_reference: row
-                .get::<_, Option<String>>(13)?
+                .get::<_, Option<String>>(15)?
                 .map(|tracker| GazelleReference {
                     tracker,
-                    torrent_id: row.get(14).unwrap_or(None),
-                    release_group_id: row.get(15).unwrap_or(None),
+                    torrent_id: row.get(16).unwrap_or(None),
+                    release_group_id: row.get(17).unwrap_or(None),
                 }),
         },
     })
@@ -1498,6 +1663,66 @@ fn load_import_batch_paths(
     Ok(paths)
 }
 
+fn write_release_instance(
+    transaction: &Transaction<'_>,
+    release_instance: &ReleaseInstance,
+) -> Result<(), RepositoryError> {
+    transaction
+        .execute(
+            "INSERT INTO release_instances
+             (id, import_batch_id, source_id, release_id, state, format_family, bitrate_mode,
+              bitrate_kbps, sample_rate_hz, bit_depth, track_count, total_duration_seconds,
+              ingest_origin, import_mode, duplicate_status, export_visibility_policy,
+              original_source_path, imported_at_unix_seconds, gazelle_tracker,
+              gazelle_torrent_id, gazelle_release_group_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, NULL,
+                     NULL, ?14, ?15, ?16, ?17, ?18)",
+            params![
+                release_instance.id.as_uuid().to_string(),
+                release_instance.import_batch_id.as_uuid().to_string(),
+                release_instance.source_id.as_uuid().to_string(),
+                release_instance
+                    .release_id
+                    .as_ref()
+                    .map(|value| value.as_uuid().to_string()),
+                release_instance_state_to_sql(&release_instance.state),
+                format_family_to_sql(&release_instance.technical_variant.format_family),
+                bitrate_mode_to_sql(&release_instance.technical_variant.bitrate_mode),
+                release_instance
+                    .technical_variant
+                    .bitrate_kbps
+                    .map(i64::from),
+                release_instance
+                    .technical_variant
+                    .sample_rate_hz
+                    .map(i64::from),
+                release_instance.technical_variant.bit_depth.map(i64::from),
+                i64::from(release_instance.technical_variant.track_count),
+                i64::from(release_instance.technical_variant.total_duration_seconds),
+                ingest_origin_to_sql(&release_instance.provenance.ingest_origin),
+                &release_instance.provenance.original_source_path,
+                release_instance.provenance.imported_at_unix_seconds,
+                release_instance
+                    .provenance
+                    .gazelle_reference
+                    .as_ref()
+                    .map(|value| value.tracker.clone()),
+                release_instance
+                    .provenance
+                    .gazelle_reference
+                    .as_ref()
+                    .and_then(|value| value.torrent_id.clone()),
+                release_instance
+                    .provenance
+                    .gazelle_reference
+                    .as_ref()
+                    .and_then(|value| value.release_group_id.clone()),
+            ],
+        )
+        .map_err(to_storage_error)?;
+    Ok(())
+}
+
 fn parse_uuid_id<T>(value: rusqlite::types::ValueRef<'_>, column: usize) -> rusqlite::Result<T>
 where
     T: ParseUuidId,
@@ -1612,6 +1837,15 @@ fn format_family_to_sql(value: &FormatFamily) -> String {
     .to_string()
 }
 
+fn bitrate_mode_to_sql(value: &BitrateMode) -> String {
+    match value {
+        BitrateMode::Constant => "constant",
+        BitrateMode::Variable => "variable",
+        BitrateMode::Lossless => "lossless",
+    }
+    .to_string()
+}
+
 fn parse_bitrate_mode(value: String) -> BitrateMode {
     match value.as_str() {
         "constant" => BitrateMode::Constant,
@@ -1628,6 +1862,15 @@ fn parse_ingest_origin(value: String) -> IngestOrigin {
     }
 }
 
+fn ingest_origin_to_sql(value: &IngestOrigin) -> String {
+    match value {
+        IngestOrigin::WatchDirectory => "watch_directory",
+        IngestOrigin::ApiPush => "api_push",
+        IngestOrigin::ManualAdd => "manual_add",
+    }
+    .to_string()
+}
+
 fn parse_candidate_provider(value: String) -> CandidateProvider {
     match value.as_str() {
         "musicbrainz" => CandidateProvider::MusicBrainz,
@@ -1635,10 +1878,33 @@ fn parse_candidate_provider(value: String) -> CandidateProvider {
     }
 }
 
+fn candidate_provider_to_sql(value: &CandidateProvider) -> String {
+    match value {
+        CandidateProvider::MusicBrainz => "musicbrainz",
+        CandidateProvider::Discogs => "discogs",
+    }
+    .to_string()
+}
+
 fn parse_candidate_subject(kind: String, provider_id: String) -> CandidateSubject {
     match kind.as_str() {
         "release" => CandidateSubject::Release { provider_id },
         _ => CandidateSubject::ReleaseGroup { provider_id },
+    }
+}
+
+fn candidate_subject_kind_to_sql(value: &CandidateSubject) -> String {
+    match value {
+        CandidateSubject::Release { .. } => "release",
+        CandidateSubject::ReleaseGroup { .. } => "release_group",
+    }
+    .to_string()
+}
+
+fn candidate_subject_id(value: &CandidateSubject) -> String {
+    match value {
+        CandidateSubject::Release { provider_id }
+        | CandidateSubject::ReleaseGroup { provider_id } => provider_id.clone(),
     }
 }
 
@@ -1683,6 +1949,22 @@ fn parse_evidence_kind(value: &str) -> EvidenceKind {
         "gazelle_consistency" => EvidenceKind::GazelleConsistency,
         other => EvidenceKind::Other(other.to_string()),
     }
+}
+
+fn evidence_kind_to_sql(value: &EvidenceKind) -> String {
+    match value {
+        EvidenceKind::ArtistMatch => "artist_match",
+        EvidenceKind::AlbumTitleMatch => "album_title_match",
+        EvidenceKind::TrackCountMatch => "track_count_match",
+        EvidenceKind::DurationAlignment => "duration_alignment",
+        EvidenceKind::DiscCountMatch => "disc_count_match",
+        EvidenceKind::DateProximity => "date_proximity",
+        EvidenceKind::LabelCatalogAlignment => "label_catalog_alignment",
+        EvidenceKind::FilenameSimilarity => "filename_similarity",
+        EvidenceKind::GazelleConsistency => "gazelle_consistency",
+        EvidenceKind::Other(other) => other,
+    }
+    .to_string()
 }
 
 fn parse_provider_provenance(raw: String) -> Result<ProviderProvenance, String> {
@@ -1950,6 +2232,30 @@ fn serialize_staged_files(values: &[StagedFile]) -> Result<String, RepositoryErr
             .collect::<Vec<_>>(),
     )
     .map_err(|error| storage_error(format!("failed to serialize staged files: {error}")))
+}
+
+fn serialize_evidence_notes(values: &[EvidenceNote]) -> Result<String, String> {
+    serde_json::to_string(
+        &values
+            .iter()
+            .map(|value| {
+                json!({
+                    "kind": evidence_kind_to_sql(&value.kind),
+                    "detail": value.detail,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| format!("failed to serialize evidence notes: {error}"))
+}
+
+fn serialize_provider_provenance(value: &ProviderProvenance) -> Result<String, String> {
+    serde_json::to_string(&json!({
+        "provider_name": value.provider_name,
+        "query": value.query,
+        "fetched_at_unix_seconds": value.fetched_at_unix_seconds,
+    }))
+    .map_err(|error| format!("failed to serialize provider provenance: {error}"))
 }
 
 fn parse_staged_files(raw: String) -> Result<Vec<StagedFile>, String> {
@@ -2515,13 +2821,20 @@ mod tests {
     use crate::application::ingest::WatchDiscoveryService;
     use crate::application::repository::{
         ExportRepository, IngestEvidenceRepository, IssueRepository, JobCommandRepository,
-        JobRepository, MetadataSnapshotRepository, ReleaseInstanceRepository, ReleaseRepository,
-        StagingManifestRepository,
+        JobRepository, MetadataSnapshotRepository, ReleaseInstanceCommandRepository,
+        ReleaseInstanceRepository, ReleaseRepository, StagingManifestRepository,
+    };
+    use crate::domain::candidate_match::{
+        CandidateMatch, CandidateProvider, CandidateScore, CandidateSubject, EvidenceKind,
+        EvidenceNote, ProviderProvenance,
     };
     use crate::domain::issue::IssueState;
     use crate::domain::job::{JobStatus, JobSubject, JobTrigger, JobType};
     use crate::domain::metadata_snapshot::{MetadataSnapshotSource, SnapshotFormat};
-    use crate::domain::release_instance::{FormatFamily, ReleaseInstanceState};
+    use crate::domain::release_instance::{
+        BitrateMode, FormatFamily, IngestOrigin, ProvenanceSnapshot, ReleaseInstance,
+        ReleaseInstanceState, TechnicalVariant,
+    };
     use id3::TagLike;
     use uuid::Uuid;
 
@@ -2699,6 +3012,80 @@ mod tests {
             .expect("query should succeed");
         assert_eq!(exports.total, 2);
         assert!(exports.has_more());
+    }
+
+    #[test]
+    fn repositories_persist_provisional_release_instances_and_candidates() {
+        let (context, _path) = seeded_context();
+        let repositories = SqliteRepositories::new(context);
+        let import_batch_id: ImportBatchId = parse_uuid(SeedIds::IMPORT_BATCH);
+        let source_id: SourceId = parse_uuid(SeedIds::SOURCE);
+        let release_instance = ReleaseInstance {
+            id: ReleaseInstanceId::new(),
+            import_batch_id: import_batch_id.clone(),
+            source_id,
+            release_id: None,
+            state: ReleaseInstanceState::NeedsReview,
+            technical_variant: TechnicalVariant {
+                format_family: FormatFamily::Mp3,
+                bitrate_mode: BitrateMode::Variable,
+                bitrate_kbps: None,
+                sample_rate_hz: None,
+                bit_depth: None,
+                track_count: 1,
+                total_duration_seconds: 245,
+            },
+            provenance: ProvenanceSnapshot {
+                ingest_origin: IngestOrigin::ManualAdd,
+                original_source_path: "/incoming/Kid A/01 Everything.mp3".to_string(),
+                imported_at_unix_seconds: 321,
+                gazelle_reference: None,
+            },
+        };
+
+        repositories
+            .create_release_instance(&release_instance)
+            .expect("release instance should persist");
+        repositories
+            .replace_candidate_matches(
+                &release_instance.id,
+                &[CandidateMatch {
+                    id: CandidateMatchId::new(),
+                    release_instance_id: release_instance.id.clone(),
+                    provider: CandidateProvider::MusicBrainz,
+                    subject: CandidateSubject::Release {
+                        provider_id: "mb-release-1".to_string(),
+                    },
+                    normalized_score: CandidateScore::new(0.88),
+                    evidence_matches: vec![EvidenceNote {
+                        kind: EvidenceKind::ArtistMatch,
+                        detail: "artist names aligned".to_string(),
+                    }],
+                    mismatches: Vec::new(),
+                    unresolved_ambiguities: vec!["vinyl reissue also matched".to_string()],
+                    provider_provenance: ProviderProvenance {
+                        provider_name: "musicbrainz".to_string(),
+                        query: "\"Kid A\" AND artist:\"Radiohead\"".to_string(),
+                        fetched_at_unix_seconds: 322,
+                    },
+                }],
+            )
+            .expect("candidate matches should persist");
+
+        let stored_instances = repositories
+            .list_release_instances_for_batch(&import_batch_id)
+            .expect("batch release instances should load");
+        assert!(
+            stored_instances
+                .iter()
+                .any(|item| item.id == release_instance.id && item.release_id.is_none())
+        );
+
+        let stored_candidates = repositories
+            .list_candidate_matches(&release_instance.id, &PageRequest::new(10, 0))
+            .expect("candidate matches should load");
+        assert_eq!(stored_candidates.total, 1);
+        assert_eq!(stored_candidates.items[0].normalized_score.value(), 0.88);
     }
 
     #[test]
@@ -2986,28 +3373,36 @@ mod tests {
         transaction
             .execute(
                 "INSERT INTO release_instances
-                 (id, release_id, source_id, state, format_family, bitrate_mode, bitrate_kbps,
-                  sample_rate_hz, bit_depth, track_count, total_duration_seconds, ingest_origin,
-                  import_mode, duplicate_status, export_visibility_policy, original_source_path,
-                  imported_at_unix_seconds, gazelle_tracker, gazelle_torrent_id, gazelle_release_group_id)
-                 VALUES (?1, ?2, ?3, 'matched', 'flac', 'lossless', NULL, 44100, 16,
+                 (id, import_batch_id, release_id, source_id, state, format_family, bitrate_mode,
+                  bitrate_kbps, sample_rate_hz, bit_depth, track_count, total_duration_seconds,
+                  ingest_origin, import_mode, duplicate_status, export_visibility_policy,
+                  original_source_path, imported_at_unix_seconds, gazelle_tracker,
+                  gazelle_torrent_id, gazelle_release_group_id)
+                 VALUES (?1, ?2, ?3, ?4, 'matched', 'flac', 'lossless', NULL, 44100, 16,
                          10, 2550, 'watch_directory', 'copy', NULL, NULL,
                          '/incoming/radiohead/In Rainbows', 120, 'redacted', '999', '555')",
-                params![SeedIds::RELEASE_INSTANCE, SeedIds::RELEASE, SeedIds::SOURCE],
+                params![
+                    SeedIds::RELEASE_INSTANCE,
+                    SeedIds::IMPORT_BATCH,
+                    SeedIds::RELEASE,
+                    SeedIds::SOURCE
+                ],
             )
             .map_err(to_storage_error)?;
         transaction
             .execute(
                 "INSERT INTO release_instances
-                 (id, release_id, source_id, state, format_family, bitrate_mode, bitrate_kbps,
-                  sample_rate_hz, bit_depth, track_count, total_duration_seconds, ingest_origin,
-                  import_mode, duplicate_status, export_visibility_policy, original_source_path,
-                  imported_at_unix_seconds, gazelle_tracker, gazelle_torrent_id, gazelle_release_group_id)
-                 VALUES (?1, ?2, ?3, 'matched', 'flac', 'constant', 320, 48000, 24,
+                 (id, import_batch_id, release_id, source_id, state, format_family, bitrate_mode,
+                  bitrate_kbps, sample_rate_hz, bit_depth, track_count, total_duration_seconds,
+                  ingest_origin, import_mode, duplicate_status, export_visibility_policy,
+                  original_source_path, imported_at_unix_seconds, gazelle_tracker,
+                  gazelle_torrent_id, gazelle_release_group_id)
+                 VALUES (?1, ?2, ?3, ?4, 'matched', 'flac', 'constant', 320, 48000, 24,
                          8, 2100, 'manual_add', 'hardlink', NULL, NULL,
                          '/incoming/radiohead-live/Rainbows Live', 220, NULL, NULL, NULL)",
                 params![
                     SeedIds::SECOND_RELEASE_INSTANCE,
+                    SeedIds::SECOND_IMPORT_BATCH,
                     SeedIds::SECOND_RELEASE,
                     SeedIds::SOURCE
                 ],

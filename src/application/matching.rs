@@ -3,13 +3,25 @@ use std::future::Future;
 use std::path::PathBuf;
 
 use crate::application::repository::{
-    IngestEvidenceRepository, RepositoryError, RepositoryErrorKind, StagingManifestRepository,
+    ImportBatchRepository, IngestEvidenceRepository, ReleaseInstanceCommandRepository,
+    ReleaseInstanceRepository, RepositoryError, RepositoryErrorKind, SourceRepository,
+    StagingManifestRepository,
 };
+use crate::domain::candidate_match::{
+    CandidateMatch, CandidateProvider, CandidateScore, CandidateSubject, EvidenceKind,
+    EvidenceNote, ProviderProvenance,
+};
+use crate::domain::import_batch::ImportBatch;
 use crate::domain::ingest_evidence::{
     IngestEvidenceRecord, IngestEvidenceSubject, ObservedValueKind,
 };
+use crate::domain::release_instance::{
+    BitrateMode, FormatFamily, IngestOrigin, ProvenanceSnapshot, ReleaseInstance,
+    ReleaseInstanceState, TechnicalVariant,
+};
+use crate::domain::source::{Source, SourceKind};
 use crate::domain::staging_manifest::{StagedReleaseGroup, StagingManifest};
-use crate::support::ids::ImportBatchId;
+use crate::support::ids::{CandidateMatchId, ImportBatchId, ReleaseInstanceId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchingServiceError {
@@ -33,6 +45,7 @@ pub struct BatchMatchProbeReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupMatchProbe {
+    pub release_instance_id: Option<ReleaseInstanceId>,
     pub group_key: String,
     pub evidence: MatchEvidenceSummary,
     pub release_query: String,
@@ -53,6 +66,22 @@ pub struct MatchEvidenceSummary {
     pub source_descriptors: Vec<String>,
     pub tracker_identifiers: Vec<String>,
     pub evidence_conflicts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedBatchMatchReport {
+    pub batch_id: ImportBatchId,
+    pub groups: Vec<PersistedGroupMatch>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedGroupMatch {
+    pub release_instance: ReleaseInstance,
+    pub group_key: String,
+    pub evidence: MatchEvidenceSummary,
+    pub release_query: String,
+    pub release_group_query: String,
+    pub persisted_candidates: Vec<CandidateMatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +173,7 @@ where
                 .await
                 .map_err(map_provider_error)?;
             groups.push(GroupMatchProbe {
+                release_instance_id: None,
                 group_key: group.key.clone(),
                 evidence: summary,
                 release_query,
@@ -154,6 +184,118 @@ where
         }
 
         Ok(BatchMatchProbeReport {
+            batch_id: batch_id.clone(),
+            groups,
+        })
+    }
+}
+
+impl<R, P> ReleaseMatchingService<R, P>
+where
+    R: ImportBatchRepository
+        + IngestEvidenceRepository
+        + ReleaseInstanceCommandRepository
+        + ReleaseInstanceRepository
+        + SourceRepository
+        + StagingManifestRepository,
+    P: MusicBrainzMetadataProvider,
+{
+    pub async fn score_and_persist_batch_matches(
+        &self,
+        batch_id: &ImportBatchId,
+        persisted_at_unix_seconds: i64,
+    ) -> Result<PersistedBatchMatchReport, MatchingServiceError> {
+        let batch = self
+            .repository
+            .get_import_batch(batch_id)
+            .map_err(map_repository_error)?
+            .ok_or_else(|| MatchingServiceError {
+                kind: MatchingServiceErrorKind::NotFound,
+                message: format!("no import batch found for {}", batch_id.as_uuid()),
+            })?;
+        let source = self
+            .repository
+            .get_source(&batch.source_id)
+            .map_err(map_repository_error)?
+            .ok_or_else(|| MatchingServiceError {
+                kind: MatchingServiceErrorKind::NotFound,
+                message: format!("no source found for batch {}", batch_id.as_uuid()),
+            })?;
+        let manifest = latest_manifest(
+            self.repository
+                .list_staging_manifests_for_batch(batch_id)
+                .map_err(map_repository_error)?,
+            batch_id,
+        )?;
+        let evidence = self
+            .repository
+            .list_ingest_evidence_for_batch(batch_id)
+            .map_err(map_repository_error)?;
+        let evidence_by_path = evidence_by_discovered_path(&evidence);
+        let evidence_by_group = evidence_by_group_key(&evidence);
+        let existing_instances = self
+            .repository
+            .list_release_instances_for_batch(batch_id)
+            .map_err(map_repository_error)?;
+
+        let mut groups = Vec::new();
+        for group in &manifest.grouping.groups {
+            let summary = summarize_group_evidence(group, &evidence_by_path, &evidence_by_group);
+            let release_query = build_release_query(&summary);
+            let release_group_query = build_release_group_query(&summary);
+            let release_candidates = self
+                .provider
+                .search_releases(&release_query, 10)
+                .await
+                .map_err(map_provider_error)?;
+            let release_group_candidates = self
+                .provider
+                .search_release_groups(&release_group_query, 10)
+                .await
+                .map_err(map_provider_error)?;
+            let release_instance = ensure_provisional_release_instance(
+                &self.repository,
+                &batch,
+                &source,
+                group,
+                &summary,
+                &evidence_by_path,
+                &existing_instances,
+            )?;
+            let persisted_candidates = score_group_candidates(
+                &release_instance.id,
+                &summary,
+                &release_query,
+                &release_group_query,
+                release_candidates,
+                release_group_candidates,
+                persisted_at_unix_seconds,
+            );
+            self.repository
+                .replace_candidate_matches(&release_instance.id, &persisted_candidates)
+                .map_err(map_repository_error)?;
+
+            let mut updated_instance = release_instance.clone();
+            updated_instance.state = if needs_review(&persisted_candidates) {
+                ReleaseInstanceState::NeedsReview
+            } else {
+                ReleaseInstanceState::Analyzed
+            };
+            self.repository
+                .update_release_instance(&updated_instance)
+                .map_err(map_repository_error)?;
+
+            groups.push(PersistedGroupMatch {
+                release_instance: updated_instance,
+                group_key: group.key.clone(),
+                evidence: summary,
+                release_query,
+                release_group_query,
+                persisted_candidates,
+            });
+        }
+
+        Ok(PersistedBatchMatchReport {
             batch_id: batch_id.clone(),
             groups,
         })
@@ -396,6 +538,502 @@ fn escape_query_value(value: &str) -> String {
     value.replace('"', "\\\"")
 }
 
+fn ensure_provisional_release_instance<R>(
+    repository: &R,
+    batch: &ImportBatch,
+    source: &Source,
+    group: &StagedReleaseGroup,
+    summary: &MatchEvidenceSummary,
+    evidence_by_path: &HashMap<PathBuf, &IngestEvidenceRecord>,
+    existing_instances: &[ReleaseInstance],
+) -> Result<ReleaseInstance, MatchingServiceError>
+where
+    R: ReleaseInstanceCommandRepository,
+{
+    let original_source_path = representative_group_path(group);
+    if let Some(existing) = existing_instances
+        .iter()
+        .find(|item| item.provenance.original_source_path == original_source_path)
+        .cloned()
+    {
+        return Ok(existing);
+    }
+
+    let release_instance = ReleaseInstance {
+        id: ReleaseInstanceId::new(),
+        import_batch_id: batch.id.clone(),
+        source_id: source.id.clone(),
+        release_id: None,
+        state: ReleaseInstanceState::Analyzed,
+        technical_variant: infer_technical_variant(group, evidence_by_path),
+        provenance: ProvenanceSnapshot {
+            ingest_origin: source_kind_to_ingest_origin(&source.kind),
+            original_source_path,
+            imported_at_unix_seconds: batch.created_at_unix_seconds,
+            gazelle_reference: gazelle_reference(summary),
+        },
+    };
+    repository
+        .create_release_instance(&release_instance)
+        .map_err(map_repository_error)?;
+    Ok(release_instance)
+}
+
+fn representative_group_path(group: &StagedReleaseGroup) -> String {
+    group_common_parent_path(group)
+        .or_else(|| {
+            group
+                .file_paths
+                .iter()
+                .min()
+                .map(|path| path.to_string_lossy().to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn group_common_parent_path(group: &StagedReleaseGroup) -> Option<String> {
+    let first_parent = group.file_paths.first()?.parent()?.to_path_buf();
+    if group
+        .file_paths
+        .iter()
+        .all(|path| path.parent() == Some(first_parent.as_path()))
+    {
+        Some(first_parent.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+fn infer_technical_variant(
+    group: &StagedReleaseGroup,
+    evidence_by_path: &HashMap<PathBuf, &IngestEvidenceRecord>,
+) -> TechnicalVariant {
+    let mut flac_votes = 0usize;
+    let mut mp3_votes = 0usize;
+    let mut disc_numbers = BTreeSet::new();
+    let mut total_duration_seconds = 0u32;
+
+    for file_path in &group.file_paths {
+        match file_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("flac") => flac_votes += 1,
+            Some("mp3") => mp3_votes += 1,
+            _ => {}
+        }
+
+        if let Some(record) = evidence_by_path.get(file_path) {
+            for observation in &record.observations {
+                match observation.kind {
+                    ObservedValueKind::FormatFamily => match observation.value.as_str() {
+                        "flac" => flac_votes += 1,
+                        "mp3" => mp3_votes += 1,
+                        _ => {}
+                    },
+                    ObservedValueKind::DiscNumber => {
+                        if let Ok(value) = observation.value.parse::<usize>() {
+                            disc_numbers.insert(value);
+                        }
+                    }
+                    ObservedValueKind::DurationMs => {
+                        if let Ok(value) = observation.value.parse::<u32>() {
+                            total_duration_seconds += value / 1000;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let format_family = if flac_votes >= mp3_votes {
+        FormatFamily::Flac
+    } else {
+        FormatFamily::Mp3
+    };
+
+    TechnicalVariant {
+        bitrate_mode: match format_family {
+            FormatFamily::Flac => BitrateMode::Lossless,
+            FormatFamily::Mp3 => BitrateMode::Variable,
+        },
+        format_family,
+        bitrate_kbps: None,
+        sample_rate_hz: None,
+        bit_depth: None,
+        track_count: group.file_paths.len() as u16,
+        total_duration_seconds,
+    }
+}
+
+fn source_kind_to_ingest_origin(value: &SourceKind) -> IngestOrigin {
+    match value {
+        SourceKind::WatchDirectory => IngestOrigin::WatchDirectory,
+        SourceKind::ApiClient | SourceKind::Gazelle => IngestOrigin::ApiPush,
+        SourceKind::ManualAdd => IngestOrigin::ManualAdd,
+    }
+}
+
+fn gazelle_reference(
+    summary: &MatchEvidenceSummary,
+) -> Option<crate::domain::release_instance::GazelleReference> {
+    summary.tracker_identifiers.first().map(|identifier| {
+        let (tracker, torrent_id) = identifier
+            .split_once(':')
+            .map(|(tracker, value)| (tracker.to_string(), Some(value.to_string())))
+            .unwrap_or_else(|| ("gazelle".to_string(), Some(identifier.clone())));
+        crate::domain::release_instance::GazelleReference {
+            tracker,
+            torrent_id,
+            release_group_id: None,
+        }
+    })
+}
+
+fn score_group_candidates(
+    release_instance_id: &ReleaseInstanceId,
+    summary: &MatchEvidenceSummary,
+    release_query: &str,
+    release_group_query: &str,
+    release_candidates: Vec<MusicBrainzReleaseCandidate>,
+    release_group_candidates: Vec<MusicBrainzReleaseGroupCandidate>,
+    persisted_at_unix_seconds: i64,
+) -> Vec<CandidateMatch> {
+    let mut candidates = release_candidates
+        .into_iter()
+        .map(|candidate| {
+            score_release_candidate(
+                release_instance_id,
+                summary,
+                release_query,
+                candidate,
+                persisted_at_unix_seconds,
+            )
+        })
+        .chain(release_group_candidates.into_iter().map(|candidate| {
+            score_release_group_candidate(
+                release_instance_id,
+                summary,
+                release_group_query,
+                candidate,
+                persisted_at_unix_seconds,
+            )
+        }))
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        right
+            .normalized_score
+            .value()
+            .total_cmp(&left.normalized_score.value())
+    });
+
+    let top_candidate_subject = candidates
+        .first()
+        .map(|candidate| candidate.subject.clone());
+    let top_score = candidates
+        .first()
+        .map(|candidate| candidate.normalized_score.value())
+        .unwrap_or(0.0);
+    for candidate in &mut candidates {
+        if top_score >= 0.80
+            && (top_score - candidate.normalized_score.value()).abs() <= 0.05
+            && Some(candidate.subject.clone()) != top_candidate_subject
+        {
+            candidate.unresolved_ambiguities.push(
+                "another high-confidence candidate remained within review distance".to_string(),
+            );
+        }
+    }
+
+    candidates
+}
+
+fn score_release_candidate(
+    release_instance_id: &ReleaseInstanceId,
+    summary: &MatchEvidenceSummary,
+    query: &str,
+    candidate: MusicBrainzReleaseCandidate,
+    persisted_at_unix_seconds: i64,
+) -> CandidateMatch {
+    let mut evidence_matches = Vec::new();
+    let mut mismatches = Vec::new();
+    let mut score = provider_rank_score(candidate.score, 0.20);
+
+    compare_artist(
+        summary.primary_artist.as_deref(),
+        &candidate.artist_names,
+        &mut evidence_matches,
+        &mut mismatches,
+        &mut score,
+    );
+    compare_release_title(
+        summary.release_title.as_deref(),
+        Some(candidate.title.as_str()),
+        &mut evidence_matches,
+        &mut mismatches,
+        &mut score,
+    );
+    compare_track_count(
+        summary.track_count,
+        candidate.track_count,
+        &mut evidence_matches,
+        &mut mismatches,
+        &mut score,
+    );
+    compare_release_year(
+        summary.release_year.as_deref(),
+        candidate.date.as_deref(),
+        &mut evidence_matches,
+        &mut mismatches,
+        &mut score,
+    );
+    compare_release_group_title(
+        summary.release_title.as_deref(),
+        candidate.release_group_title.as_deref(),
+        &mut evidence_matches,
+        &mut score,
+    );
+
+    CandidateMatch {
+        id: CandidateMatchId::new(),
+        release_instance_id: release_instance_id.clone(),
+        provider: CandidateProvider::MusicBrainz,
+        subject: CandidateSubject::Release {
+            provider_id: candidate.id,
+        },
+        normalized_score: CandidateScore::new(score.clamp(0.0, 1.0)),
+        evidence_matches,
+        mismatches,
+        unresolved_ambiguities: summary.evidence_conflicts.clone(),
+        provider_provenance: ProviderProvenance {
+            provider_name: "musicbrainz".to_string(),
+            query: query.to_string(),
+            fetched_at_unix_seconds: persisted_at_unix_seconds,
+        },
+    }
+}
+
+fn score_release_group_candidate(
+    release_instance_id: &ReleaseInstanceId,
+    summary: &MatchEvidenceSummary,
+    query: &str,
+    candidate: MusicBrainzReleaseGroupCandidate,
+    persisted_at_unix_seconds: i64,
+) -> CandidateMatch {
+    let mut evidence_matches = Vec::new();
+    let mut mismatches = Vec::new();
+    let mut score = provider_rank_score(candidate.score, 0.15);
+
+    compare_artist(
+        summary.primary_artist.as_deref(),
+        &candidate.artist_names,
+        &mut evidence_matches,
+        &mut mismatches,
+        &mut score,
+    );
+    compare_release_title(
+        summary.release_title.as_deref(),
+        Some(candidate.title.as_str()),
+        &mut evidence_matches,
+        &mut mismatches,
+        &mut score,
+    );
+    compare_release_year(
+        summary.release_year.as_deref(),
+        candidate.first_release_date.as_deref(),
+        &mut evidence_matches,
+        &mut mismatches,
+        &mut score,
+    );
+
+    CandidateMatch {
+        id: CandidateMatchId::new(),
+        release_instance_id: release_instance_id.clone(),
+        provider: CandidateProvider::MusicBrainz,
+        subject: CandidateSubject::ReleaseGroup {
+            provider_id: candidate.id,
+        },
+        normalized_score: CandidateScore::new(score.clamp(0.0, 1.0)),
+        evidence_matches,
+        mismatches,
+        unresolved_ambiguities: summary.evidence_conflicts.clone(),
+        provider_provenance: ProviderProvenance {
+            provider_name: "musicbrainz".to_string(),
+            query: query.to_string(),
+            fetched_at_unix_seconds: persisted_at_unix_seconds,
+        },
+    }
+}
+
+fn provider_rank_score(score: u16, weight: f32) -> f32 {
+    ((score as f32 / 100.0) * weight).clamp(0.0, weight)
+}
+
+fn compare_artist(
+    expected: Option<&str>,
+    candidates: &[String],
+    matches: &mut Vec<EvidenceNote>,
+    mismatches: &mut Vec<EvidenceNote>,
+    score: &mut f32,
+) {
+    if let Some(expected) = expected {
+        if candidates
+            .iter()
+            .any(|value| normalize_text(value) == normalize_text(expected))
+        {
+            *score += 0.25;
+            matches.push(note(EvidenceKind::ArtistMatch, "artist names aligned"));
+        } else {
+            mismatches.push(note(
+                EvidenceKind::ArtistMatch,
+                format!("expected artist '{expected}' did not align"),
+            ));
+        }
+    }
+}
+
+fn compare_release_title(
+    expected: Option<&str>,
+    observed: Option<&str>,
+    matches: &mut Vec<EvidenceNote>,
+    mismatches: &mut Vec<EvidenceNote>,
+    score: &mut f32,
+) {
+    if let Some(expected) = expected {
+        if observed
+            .map(|value| normalize_text(value) == normalize_text(expected))
+            .unwrap_or(false)
+        {
+            *score += 0.30;
+            matches.push(note(EvidenceKind::AlbumTitleMatch, "release title aligned"));
+        } else {
+            mismatches.push(note(
+                EvidenceKind::AlbumTitleMatch,
+                format!("expected title '{expected}' did not align"),
+            ));
+        }
+    }
+}
+
+fn compare_track_count(
+    expected: usize,
+    observed: Option<u32>,
+    matches: &mut Vec<EvidenceNote>,
+    mismatches: &mut Vec<EvidenceNote>,
+    score: &mut f32,
+) {
+    if expected == 0 {
+        return;
+    }
+    if observed == Some(expected as u32) {
+        *score += 0.15;
+        matches.push(note(
+            EvidenceKind::TrackCountMatch,
+            format!("track count matched at {expected}"),
+        ));
+    } else if let Some(observed) = observed {
+        mismatches.push(note(
+            EvidenceKind::TrackCountMatch,
+            format!("expected {expected} tracks, found {observed}"),
+        ));
+    }
+}
+
+fn compare_release_year(
+    expected: Option<&str>,
+    observed: Option<&str>,
+    matches: &mut Vec<EvidenceNote>,
+    mismatches: &mut Vec<EvidenceNote>,
+    score: &mut f32,
+) {
+    let expected_year = expected.and_then(parse_year);
+    let observed_year = observed.and_then(parse_year);
+    match (expected_year, observed_year) {
+        (Some(expected_year), Some(observed_year)) if expected_year == observed_year => {
+            *score += 0.10;
+            matches.push(note(
+                EvidenceKind::DateProximity,
+                format!("release year matched at {expected_year}"),
+            ));
+        }
+        (Some(expected_year), Some(observed_year))
+            if expected_year.abs_diff(observed_year) == 1 =>
+        {
+            *score += 0.05;
+            matches.push(note(
+                EvidenceKind::DateProximity,
+                format!("release year was within one year ({observed_year})"),
+            ));
+        }
+        (Some(expected_year), Some(observed_year)) => mismatches.push(note(
+            EvidenceKind::DateProximity,
+            format!("expected year {expected_year}, found {observed_year}"),
+        )),
+        _ => {}
+    }
+}
+
+fn compare_release_group_title(
+    expected: Option<&str>,
+    observed: Option<&str>,
+    matches: &mut Vec<EvidenceNote>,
+    score: &mut f32,
+) {
+    if expected.is_some()
+        && observed
+            .map(|value| normalize_text(value) == normalize_text(expected.unwrap_or_default()))
+            .unwrap_or(false)
+    {
+        *score += 0.05;
+        matches.push(note(
+            EvidenceKind::AlbumTitleMatch,
+            "release-group title aligned",
+        ));
+    }
+}
+
+fn note(kind: EvidenceKind, detail: impl Into<String>) -> EvidenceNote {
+    EvidenceNote {
+        kind,
+        detail: detail.into(),
+    }
+}
+
+fn normalize_text(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|value| value.is_alphanumeric())
+        .collect()
+}
+
+fn parse_year(value: &str) -> Option<u16> {
+    value.get(0..4)?.parse().ok()
+}
+
+fn needs_review(candidates: &[CandidateMatch]) -> bool {
+    let Some(best) = candidates.first() else {
+        return true;
+    };
+
+    if !matches!(best.subject, CandidateSubject::Release { .. }) {
+        return true;
+    }
+
+    if best.normalized_score.value() < 0.80 || !best.unresolved_ambiguities.is_empty() {
+        return true;
+    }
+
+    candidates
+        .iter()
+        .skip(1)
+        .any(|candidate| best.normalized_score.value() - candidate.normalized_score.value() <= 0.05)
+}
+
 fn map_repository_error(error: RepositoryError) -> MatchingServiceError {
     MatchingServiceError {
         kind: match error.kind {
@@ -422,14 +1060,24 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
+    use crate::application::repository::{
+        ImportBatchRepository, ReleaseInstanceCommandRepository, ReleaseInstanceRepository,
+        SourceRepository,
+    };
+    use crate::domain::candidate_match::CandidateMatch;
+    use crate::domain::import_batch::{BatchRequester, ImportBatch, ImportBatchStatus, ImportMode};
     use crate::domain::ingest_evidence::{
         IngestEvidenceRecord, IngestEvidenceSource, IngestEvidenceSubject, ObservedValue,
     };
-    use crate::domain::source::SourceKind;
+    use crate::domain::release_instance::{ReleaseInstance, ReleaseInstanceState};
+    use crate::domain::source::{Source, SourceKind, SourceLocator};
     use crate::domain::staging_manifest::{
         AuxiliaryFile, GroupingDecision, GroupingStrategy, StagingManifestSource,
     };
-    use crate::support::ids::{ImportBatchId, IngestEvidenceId, StagingManifestId};
+    use crate::support::ids::{
+        CandidateMatchId, ImportBatchId, IngestEvidenceId, ReleaseInstanceId, SourceId,
+        StagingManifestId,
+    };
 
     #[test]
     fn evidence_summary_prefers_embedded_tags_over_yaml_conflicts() {
@@ -521,20 +1169,102 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn scoring_persists_candidates_and_marks_reviewable_groups() {
+        let batch_id = ImportBatchId::new();
+        let repository = InMemoryMatchingRepository::with_batch(batch_id.clone());
+        let provider = FakeMusicBrainzProvider::with_release_candidates(vec![
+            MusicBrainzReleaseCandidate {
+                id: "release-strong".to_string(),
+                title: "Kid A".to_string(),
+                score: 96,
+                artist_names: vec!["Radiohead".to_string()],
+                release_group_id: Some("group-1".to_string()),
+                release_group_title: Some("Kid A".to_string()),
+                country: Some("GB".to_string()),
+                date: Some("2000-10-02".to_string()),
+                track_count: Some(1),
+            },
+            MusicBrainzReleaseCandidate {
+                id: "release-near".to_string(),
+                title: "Kid A".to_string(),
+                score: 94,
+                artist_names: vec!["Radiohead".to_string()],
+                release_group_id: Some("group-2".to_string()),
+                release_group_title: Some("Kid A".to_string()),
+                country: Some("GB".to_string()),
+                date: Some("2000-10-03".to_string()),
+                track_count: Some(1),
+            },
+        ]);
+        let service = ReleaseMatchingService::new(repository.clone(), provider);
+
+        let report = service
+            .score_and_persist_batch_matches(&batch_id, 77)
+            .await
+            .expect("candidate scoring should succeed");
+
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(
+            report.groups[0].release_instance.state,
+            ReleaseInstanceState::NeedsReview
+        );
+        assert_eq!(report.groups[0].persisted_candidates.len(), 3);
+        assert!(
+            report.groups[0]
+                .persisted_candidates
+                .iter()
+                .all(|candidate| candidate.release_instance_id
+                    == report.groups[0].release_instance.id)
+        );
+
+        let stored = repository
+            .stored_candidates(&report.groups[0].release_instance.id)
+            .expect("stored candidates should exist");
+        assert_eq!(stored.len(), 3);
+        assert!(stored.iter().any(|candidate| {
+            matches!(
+                candidate.subject,
+                CandidateSubject::Release {
+                    ref provider_id
+                } if provider_id == "release-strong"
+            )
+        }));
+    }
+
     #[derive(Clone)]
     struct FakeMusicBrainzProvider {
         queries: Arc<Mutex<Vec<String>>>,
+        release_candidates: Arc<Vec<MusicBrainzReleaseCandidate>>,
     }
 
     impl Default for FakeMusicBrainzProvider {
         fn default() -> Self {
             Self {
                 queries: Arc::new(Mutex::new(Vec::new())),
+                release_candidates: Arc::new(vec![MusicBrainzReleaseCandidate {
+                    id: "release-1".to_string(),
+                    title: "Kid A".to_string(),
+                    score: 100,
+                    artist_names: vec!["Radiohead".to_string()],
+                    release_group_id: Some("group-1".to_string()),
+                    release_group_title: Some("Kid A".to_string()),
+                    country: Some("GB".to_string()),
+                    date: Some("2000-10-02".to_string()),
+                    track_count: Some(10),
+                }]),
             }
         }
     }
 
     impl FakeMusicBrainzProvider {
+        fn with_release_candidates(release_candidates: Vec<MusicBrainzReleaseCandidate>) -> Self {
+            Self {
+                release_candidates: Arc::new(release_candidates),
+                ..Self::default()
+            }
+        }
+
         fn queries(&self) -> Vec<String> {
             self.queries.lock().expect("queries should lock").clone()
         }
@@ -550,17 +1280,7 @@ mod tests {
                 .lock()
                 .expect("queries should lock")
                 .push(query.to_string());
-            let items = vec![MusicBrainzReleaseCandidate {
-                id: "release-1".to_string(),
-                title: "Kid A".to_string(),
-                score: 100,
-                artist_names: vec!["Radiohead".to_string()],
-                release_group_id: Some("group-1".to_string()),
-                release_group_title: Some("Kid A".to_string()),
-                country: Some("GB".to_string()),
-                date: Some("2000-10-02".to_string()),
-                track_count: Some(10),
-            }];
+            let items = (*self.release_candidates).clone();
             async move { Ok(items) }
         }
 
@@ -588,12 +1308,36 @@ mod tests {
 
     #[derive(Clone)]
     struct InMemoryMatchingRepository {
+        batch: Arc<ImportBatch>,
+        source: Arc<Source>,
         manifests: Arc<Vec<StagingManifest>>,
         evidence: Arc<Vec<IngestEvidenceRecord>>,
+        release_instances: Arc<Mutex<Vec<ReleaseInstance>>>,
+        candidate_matches: Arc<Mutex<HashMap<ReleaseInstanceId, Vec<CandidateMatch>>>>,
     }
 
     impl InMemoryMatchingRepository {
         fn with_batch(batch_id: ImportBatchId) -> Self {
+            let source = Source {
+                id: SourceId::new(),
+                kind: SourceKind::ManualAdd,
+                display_name: "manual".to_string(),
+                locator: SourceLocator::ManualEntry {
+                    submitted_path: PathBuf::from("/incoming/Kid A"),
+                },
+                external_reference: None,
+            };
+            let batch = ImportBatch {
+                id: batch_id.clone(),
+                source_id: source.id.clone(),
+                mode: ImportMode::Copy,
+                status: ImportBatchStatus::Grouped,
+                requested_by: BatchRequester::Operator {
+                    name: "operator".to_string(),
+                },
+                created_at_unix_seconds: 1,
+                received_paths: vec![PathBuf::from("/incoming/Kid A")],
+            };
             let group = StagedReleaseGroup {
                 key: "kid-a".to_string(),
                 file_paths: vec![PathBuf::from("/incoming/Kid A/01 Everything.mp3")],
@@ -603,7 +1347,7 @@ mod tests {
                 id: StagingManifestId::new(),
                 batch_id: batch_id.clone(),
                 source: StagingManifestSource {
-                    kind: SourceKind::ManualAdd,
+                    kind: source.kind.clone(),
                     source_path: PathBuf::from("/incoming/Kid A"),
                 },
                 discovered_files: Vec::new(),
@@ -638,9 +1382,53 @@ mod tests {
                 ),
             ];
             Self {
+                batch: Arc::new(batch),
+                source: Arc::new(source),
                 manifests: Arc::new(vec![manifest]),
                 evidence: Arc::new(evidence),
+                release_instances: Arc::new(Mutex::new(Vec::new())),
+                candidate_matches: Arc::new(Mutex::new(HashMap::new())),
             }
+        }
+
+        fn stored_candidates(
+            &self,
+            release_instance_id: &ReleaseInstanceId,
+        ) -> Option<Vec<CandidateMatch>> {
+            self.candidate_matches
+                .lock()
+                .expect("candidate matches should lock")
+                .get(release_instance_id)
+                .cloned()
+        }
+    }
+
+    impl ImportBatchRepository for InMemoryMatchingRepository {
+        fn get_import_batch(
+            &self,
+            id: &ImportBatchId,
+        ) -> Result<Option<ImportBatch>, RepositoryError> {
+            Ok((self.batch.id == *id).then(|| (*self.batch).clone()))
+        }
+
+        fn list_import_batches(
+            &self,
+            _query: &crate::application::repository::ImportBatchListQuery,
+        ) -> Result<crate::support::pagination::Page<ImportBatch>, RepositoryError> {
+            unimplemented!("not needed in matching tests")
+        }
+    }
+
+    impl SourceRepository for InMemoryMatchingRepository {
+        fn get_source(&self, id: &SourceId) -> Result<Option<Source>, RepositoryError> {
+            Ok((self.source.id == *id).then(|| (*self.source).clone()))
+        }
+
+        fn find_source_by_locator(
+            &self,
+            _locator: &SourceLocator,
+        ) -> Result<Option<Source>, RepositoryError> {
+            unimplemented!("not needed in matching tests")
         }
     }
 
@@ -669,6 +1457,98 @@ mod tests {
                 .filter(|record| record.batch_id == *batch_id)
                 .cloned()
                 .collect())
+        }
+    }
+
+    impl ReleaseInstanceRepository for InMemoryMatchingRepository {
+        fn get_release_instance(
+            &self,
+            id: &ReleaseInstanceId,
+        ) -> Result<Option<ReleaseInstance>, RepositoryError> {
+            Ok(self
+                .release_instances
+                .lock()
+                .expect("release instances should lock")
+                .iter()
+                .find(|instance| instance.id == *id)
+                .cloned())
+        }
+
+        fn list_release_instances(
+            &self,
+            _query: &crate::application::repository::ReleaseInstanceListQuery,
+        ) -> Result<crate::support::pagination::Page<ReleaseInstance>, RepositoryError> {
+            unimplemented!("not needed in matching tests")
+        }
+
+        fn list_release_instances_for_batch(
+            &self,
+            import_batch_id: &ImportBatchId,
+        ) -> Result<Vec<ReleaseInstance>, RepositoryError> {
+            Ok(self
+                .release_instances
+                .lock()
+                .expect("release instances should lock")
+                .iter()
+                .filter(|instance| instance.import_batch_id == *import_batch_id)
+                .cloned()
+                .collect())
+        }
+
+        fn list_candidate_matches(
+            &self,
+            _release_instance_id: &ReleaseInstanceId,
+            _page: &crate::support::pagination::PageRequest,
+        ) -> Result<crate::support::pagination::Page<CandidateMatch>, RepositoryError> {
+            unimplemented!("not needed in matching tests")
+        }
+
+        fn get_candidate_match(
+            &self,
+            _id: &CandidateMatchId,
+        ) -> Result<Option<CandidateMatch>, RepositoryError> {
+            unimplemented!("not needed in matching tests")
+        }
+    }
+
+    impl ReleaseInstanceCommandRepository for InMemoryMatchingRepository {
+        fn create_release_instance(
+            &self,
+            release_instance: &ReleaseInstance,
+        ) -> Result<(), RepositoryError> {
+            self.release_instances
+                .lock()
+                .expect("release instances should lock")
+                .push(release_instance.clone());
+            Ok(())
+        }
+
+        fn update_release_instance(
+            &self,
+            release_instance: &ReleaseInstance,
+        ) -> Result<(), RepositoryError> {
+            let mut instances = self
+                .release_instances
+                .lock()
+                .expect("release instances should lock");
+            let existing = instances
+                .iter_mut()
+                .find(|instance| instance.id == release_instance.id)
+                .expect("release instance should exist");
+            *existing = release_instance.clone();
+            Ok(())
+        }
+
+        fn replace_candidate_matches(
+            &self,
+            release_instance_id: &ReleaseInstanceId,
+            matches: &[CandidateMatch],
+        ) -> Result<(), RepositoryError> {
+            self.candidate_matches
+                .lock()
+                .expect("candidate matches should lock")
+                .insert(release_instance_id.clone(), matches.to_vec());
+            Ok(())
         }
     }
 

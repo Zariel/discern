@@ -56,10 +56,13 @@ fn release_instance_is_distinct_from_release_and_release_group() {
         discogs_release_id: None,
         edition: ReleaseEdition::default(),
     };
+    let release_id = release.id.clone();
 
     let release_instance = ReleaseInstance {
         id: ReleaseInstanceId::new(),
-        release_id: release.id.clone(),
+        import_batch_id: ImportBatchId::new(),
+        source_id: SourceId::new(),
+        release_id: Some(release_id.clone()),
         state: ReleaseInstanceState::Analyzed,
         technical_variant: TechnicalVariant {
             format_family: FormatFamily::Flac,
@@ -79,9 +82,10 @@ fn release_instance_is_distinct_from_release_and_release_group() {
     };
 
     assert_eq!(release.release_group_id, release_group.id);
-    assert_eq!(release_instance.release_id, release.id);
-    assert_ne!(release_instance.id.as_uuid(), release.id.as_uuid());
-    assert_ne!(release.id.as_uuid(), release_group.id.as_uuid());
+    assert_eq!(release_instance.release_id, Some(release_id.clone()));
+    assert_ne!(release_instance.source_id.as_uuid(), release_id.as_uuid());
+    assert_ne!(release_instance.id.as_uuid(), release_id.as_uuid());
+    assert_ne!(release_id.as_uuid(), release_group.id.as_uuid());
 }
 
 #[test]
