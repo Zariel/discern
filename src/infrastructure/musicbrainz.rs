@@ -8,7 +8,10 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use crate::application::matching::{
-    MusicBrainzMetadataProvider, MusicBrainzReleaseCandidate, MusicBrainzReleaseGroupCandidate,
+    MusicBrainzArtistCredit as MatchingArtistCredit, MusicBrainzLabelInfo as MatchingLabelInfo,
+    MusicBrainzMetadataProvider, MusicBrainzReleaseCandidate,
+    MusicBrainzReleaseDetail as MatchingReleaseDetail, MusicBrainzReleaseGroupCandidate,
+    MusicBrainzReleaseGroupRef as MatchingReleaseGroupRef,
 };
 use crate::config::MusicBrainzConfig;
 
@@ -574,6 +577,40 @@ impl MusicBrainzMetadataProvider for MusicBrainzClient {
                         first_release_date: item.first_release_date,
                     })
                     .collect()
+            })
+            .map_err(|error| error.message)
+    }
+
+    async fn lookup_release(&self, release_id: &str) -> Result<MatchingReleaseDetail, String> {
+        MusicBrainzClient::lookup_release(self, release_id)
+            .await
+            .map(|detail| MatchingReleaseDetail {
+                id: detail.id,
+                title: detail.title,
+                country: detail.country,
+                date: detail.date,
+                artist_credit: detail
+                    .artist_credit
+                    .into_iter()
+                    .map(|artist| MatchingArtistCredit {
+                        artist_id: artist.artist_id,
+                        artist_name: artist.artist_name,
+                        artist_sort_name: artist.artist_sort_name,
+                    })
+                    .collect(),
+                release_group: detail.release_group.map(|group| MatchingReleaseGroupRef {
+                    id: group.id,
+                    title: group.title,
+                    primary_type: group.primary_type,
+                }),
+                label_info: detail
+                    .label_info
+                    .into_iter()
+                    .map(|label| MatchingLabelInfo {
+                        catalog_number: label.catalog_number,
+                        label_name: label.label_name,
+                    })
+                    .collect(),
             })
             .map_err(|error| error.message)
     }

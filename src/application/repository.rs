@@ -1,3 +1,4 @@
+use crate::domain::artist::Artist;
 use crate::domain::candidate_match::CandidateMatch;
 use crate::domain::exported_metadata_snapshot::ExportedMetadataSnapshot;
 use crate::domain::import_batch::ImportBatch;
@@ -31,9 +32,19 @@ pub enum RepositoryErrorKind {
 }
 
 pub trait ReleaseRepository {
+    fn find_artist_by_musicbrainz_id(
+        &self,
+        musicbrainz_artist_id: &str,
+    ) -> Result<Option<Artist>, RepositoryError>;
+
     fn get_release_group(
         &self,
         id: &ReleaseGroupId,
+    ) -> Result<Option<ReleaseGroup>, RepositoryError>;
+
+    fn find_release_group_by_musicbrainz_id(
+        &self,
+        musicbrainz_release_group_id: &str,
     ) -> Result<Option<ReleaseGroup>, RepositoryError>;
 
     fn get_release(&self, id: &ReleaseId) -> Result<Option<Release>, RepositoryError>;
@@ -49,6 +60,14 @@ pub trait ReleaseRepository {
     ) -> Result<Page<ReleaseGroup>, RepositoryError>;
 
     fn list_releases(&self, query: &ReleaseListQuery) -> Result<Page<Release>, RepositoryError>;
+}
+
+pub trait ReleaseCommandRepository {
+    fn create_artist(&self, artist: &Artist) -> Result<(), RepositoryError>;
+
+    fn create_release_group(&self, release_group: &ReleaseGroup) -> Result<(), RepositoryError>;
+
+    fn create_release(&self, release: &Release) -> Result<(), RepositoryError>;
 }
 
 pub trait ReleaseInstanceRepository {

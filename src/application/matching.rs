@@ -4,10 +4,11 @@ use std::path::PathBuf;
 
 use crate::application::repository::{
     ImportBatchRepository, IngestEvidenceRepository, IssueCommandRepository, IssueListQuery,
-    IssueRepository, MetadataSnapshotCommandRepository, ReleaseInstanceCommandRepository,
-    ReleaseInstanceRepository, RepositoryError, RepositoryErrorKind, SourceRepository,
-    StagingManifestRepository,
+    IssueRepository, MetadataSnapshotCommandRepository, ReleaseCommandRepository,
+    ReleaseInstanceCommandRepository, ReleaseInstanceRepository, ReleaseRepository,
+    RepositoryError, RepositoryErrorKind, SourceRepository, StagingManifestRepository,
 };
+use crate::domain::artist::Artist;
 use crate::domain::candidate_match::{
     CandidateMatch, CandidateProvider, CandidateScore, CandidateSubject, EvidenceKind,
     EvidenceNote, ProviderProvenance,
@@ -20,6 +21,8 @@ use crate::domain::issue::{Issue, IssueState, IssueSubject, IssueType};
 use crate::domain::metadata_snapshot::{
     MetadataSnapshot, MetadataSnapshotSource, MetadataSubject, SnapshotFormat,
 };
+use crate::domain::release::{PartialDate, Release, ReleaseEdition};
+use crate::domain::release_group::{ReleaseGroup, ReleaseGroupKind};
 use crate::domain::release_instance::{
     BitrateMode, FormatFamily, IngestOrigin, ProvenanceSnapshot, ReleaseInstance,
     ReleaseInstanceState, TechnicalVariant,
@@ -155,6 +158,51 @@ pub struct DiscogsEnrichmentReport {
     pub field_differences: Vec<DiscogsFieldDifference>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusicBrainzReleaseDetail {
+    pub id: String,
+    pub title: String,
+    pub country: Option<String>,
+    pub date: Option<String>,
+    pub artist_credit: Vec<MusicBrainzArtistCredit>,
+    pub release_group: Option<MusicBrainzReleaseGroupRef>,
+    pub label_info: Vec<MusicBrainzLabelInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusicBrainzArtistCredit {
+    pub artist_id: String,
+    pub artist_name: String,
+    pub artist_sort_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusicBrainzReleaseGroupRef {
+    pub id: String,
+    pub title: String,
+    pub primary_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusicBrainzLabelInfo {
+    pub catalog_number: Option<String>,
+    pub label_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedBatchMatchReport {
+    pub batch_id: ImportBatchId,
+    pub groups: Vec<MaterializedReleaseMatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedReleaseMatch {
+    pub release_instance: ReleaseInstance,
+    pub release: Release,
+    pub release_group: ReleaseGroup,
+    pub artist: Artist,
+}
+
 pub trait MusicBrainzMetadataProvider {
     fn search_releases(
         &self,
@@ -167,6 +215,11 @@ pub trait MusicBrainzMetadataProvider {
         query: &str,
         limit: u8,
     ) -> impl Future<Output = Result<Vec<MusicBrainzReleaseGroupCandidate>, String>> + Send;
+
+    fn lookup_release(
+        &self,
+        release_id: &str,
+    ) -> impl Future<Output = Result<MusicBrainzReleaseDetail, String>> + Send;
 }
 
 pub trait DiscogsMetadataProvider {
@@ -252,8 +305,10 @@ where
         + IssueCommandRepository
         + IssueRepository
         + MetadataSnapshotCommandRepository
+        + ReleaseCommandRepository
         + ReleaseInstanceCommandRepository
         + ReleaseInstanceRepository
+        + ReleaseRepository
         + SourceRepository
         + StagingManifestRepository,
     P: MusicBrainzMetadataProvider + DiscogsMetadataProvider,
@@ -359,6 +414,62 @@ where
         }
 
         Ok(PersistedBatchMatchReport {
+            batch_id: batch_id.clone(),
+            groups,
+        })
+    }
+
+    pub async fn materialize_batch_matches(
+        &self,
+        batch_id: &ImportBatchId,
+    ) -> Result<MaterializedBatchMatchReport, MatchingServiceError> {
+        let release_instances = self
+            .repository
+            .list_release_instances_for_batch(batch_id)
+            .map_err(map_repository_error)?;
+        let mut groups = Vec::new();
+
+        for release_instance in release_instances {
+            if release_instance.state != ReleaseInstanceState::Analyzed {
+                continue;
+            }
+
+            let candidates = self
+                .repository
+                .list_candidate_matches(&release_instance.id, &PageRequest::new(50, 0))
+                .map_err(map_repository_error)?;
+            if review_issue_type(&candidates.items).is_some() {
+                continue;
+            }
+
+            let Some(best_release_id) = best_musicbrainz_release_id(&candidates.items) else {
+                continue;
+            };
+            let detail = self
+                .provider
+                .lookup_release(&best_release_id)
+                .await
+                .map_err(map_provider_error)?;
+            let artist = ensure_artist(&self.repository, &detail)?;
+            let release_group = ensure_release_group(&self.repository, &artist, &detail)?;
+            let release = ensure_release(&self.repository, &artist, &release_group, &detail)?;
+
+            let mut updated_instance = release_instance.clone();
+            updated_instance.release_id = Some(release.id.clone());
+            updated_instance.state = ReleaseInstanceState::Matched;
+            self.repository
+                .update_release_instance(&updated_instance)
+                .map_err(map_repository_error)?;
+
+            groups.push(MaterializedReleaseMatch {
+                release_instance: updated_instance,
+                release,
+                release_group,
+                artist,
+            });
+        }
+
+        Ok(MaterializedBatchMatchReport {
             batch_id: batch_id.clone(),
             groups,
         })
@@ -1341,6 +1452,155 @@ fn build_review_issue_content(
     }
 }
 
+fn best_musicbrainz_release_id(candidates: &[CandidateMatch]) -> Option<String> {
+    candidates.iter().find_map(|candidate| {
+        (candidate.provider == CandidateProvider::MusicBrainz).then_some(())?;
+        match &candidate.subject {
+            CandidateSubject::Release { provider_id } => Some(provider_id.clone()),
+            CandidateSubject::ReleaseGroup { .. } => None,
+        }
+    })
+}
+
+fn ensure_artist<R>(
+    repository: &R,
+    detail: &MusicBrainzReleaseDetail,
+) -> Result<Artist, MatchingServiceError>
+where
+    R: ReleaseCommandRepository + ReleaseRepository,
+{
+    let primary_credit = detail
+        .artist_credit
+        .first()
+        .ok_or_else(|| MatchingServiceError {
+            kind: MatchingServiceErrorKind::Provider,
+            message: format!("release {} did not include artist credits", detail.id),
+        })?;
+    if let Some(existing) = repository
+        .find_artist_by_musicbrainz_id(&primary_credit.artist_id)
+        .map_err(map_repository_error)?
+    {
+        return Ok(existing);
+    }
+
+    let artist = Artist {
+        id: crate::support::ids::ArtistId::new(),
+        name: primary_credit.artist_name.clone(),
+        sort_name: Some(primary_credit.artist_sort_name.clone()),
+        musicbrainz_artist_id: crate::support::ids::MusicBrainzArtistId::parse_str(
+            &primary_credit.artist_id,
+        )
+        .ok(),
+    };
+    repository
+        .create_artist(&artist)
+        .map_err(map_repository_error)?;
+    Ok(artist)
+}
+
+fn ensure_release_group<R>(
+    repository: &R,
+    artist: &Artist,
+    detail: &MusicBrainzReleaseDetail,
+) -> Result<ReleaseGroup, MatchingServiceError>
+where
+    R: ReleaseCommandRepository + ReleaseRepository,
+{
+    let Some(group_ref) = detail.release_group.as_ref() else {
+        return Err(MatchingServiceError {
+            kind: MatchingServiceErrorKind::Provider,
+            message: format!("release {} did not include a release group", detail.id),
+        });
+    };
+    if let Some(existing) = repository
+        .find_release_group_by_musicbrainz_id(&group_ref.id)
+        .map_err(map_repository_error)?
+    {
+        return Ok(existing);
+    }
+
+    let release_group =
+        ReleaseGroup {
+            id: crate::support::ids::ReleaseGroupId::new(),
+            primary_artist_id: artist.id.clone(),
+            title: group_ref.title.clone(),
+            kind: map_release_group_kind(group_ref.primary_type.as_deref()),
+            musicbrainz_release_group_id:
+                crate::support::ids::MusicBrainzReleaseGroupId::parse_str(&group_ref.id).ok(),
+        };
+    repository
+        .create_release_group(&release_group)
+        .map_err(map_repository_error)?;
+    Ok(release_group)
+}
+
+fn ensure_release<R>(
+    repository: &R,
+    artist: &Artist,
+    release_group: &ReleaseGroup,
+    detail: &MusicBrainzReleaseDetail,
+) -> Result<Release, MatchingServiceError>
+where
+    R: ReleaseCommandRepository + ReleaseRepository,
+{
+    if let Some(existing) = repository
+        .find_release_by_musicbrainz_id(&detail.id)
+        .map_err(map_repository_error)?
+    {
+        return Ok(existing);
+    }
+
+    let release = Release {
+        id: crate::support::ids::ReleaseId::new(),
+        release_group_id: release_group.id.clone(),
+        primary_artist_id: artist.id.clone(),
+        title: detail.title.clone(),
+        musicbrainz_release_id: crate::support::ids::MusicBrainzReleaseId::parse_str(&detail.id)
+            .ok(),
+        discogs_release_id: None,
+        edition: ReleaseEdition {
+            edition_title: None,
+            disambiguation: None,
+            country: detail.country.clone(),
+            label: detail
+                .label_info
+                .iter()
+                .find_map(|label| label.label_name.clone()),
+            catalog_number: detail
+                .label_info
+                .iter()
+                .find_map(|label| label.catalog_number.clone()),
+            release_date: parse_partial_date(detail.date.as_deref()),
+        },
+    };
+    repository
+        .create_release(&release)
+        .map_err(map_repository_error)?;
+    Ok(release)
+}
+
+fn map_release_group_kind(primary_type: Option<&str>) -> ReleaseGroupKind {
+    match primary_type.map(normalize_text).as_deref() {
+        Some("album") => ReleaseGroupKind::Album,
+        Some("ep") => ReleaseGroupKind::Ep,
+        Some("single") => ReleaseGroupKind::Single,
+        Some("live") => ReleaseGroupKind::Live,
+        Some("compilation") => ReleaseGroupKind::Compilation,
+        Some("soundtrack") => ReleaseGroupKind::Soundtrack,
+        Some(other) => ReleaseGroupKind::Other(other.to_string()),
+        None => ReleaseGroupKind::Album,
+    }
+}
+
+fn parse_partial_date(value: Option<&str>) -> Option<PartialDate> {
+    let value = value?;
+    let mut parts = value.split('-');
+    let year = parts.next()?.parse().ok()?;
+    let month = parts.next().and_then(|part| part.parse().ok());
+    let day = parts.next().and_then(|part| part.parse().ok());
+    Some(PartialDate { year, month, day })
+}
+
 fn build_discogs_query(summary: &MatchEvidenceSummary) -> DiscogsReleaseQuery {
     DiscogsReleaseQuery {
         text: summary
@@ -1582,9 +1842,11 @@ mod tests {
 
     use crate::application::repository::{
         ImportBatchRepository, IssueCommandRepository, IssueListQuery, IssueRepository,
-        MetadataSnapshotCommandRepository, ReleaseInstanceCommandRepository,
-        ReleaseInstanceRepository, SourceRepository,
+        MetadataSnapshotCommandRepository, ReleaseCommandRepository,
+        ReleaseInstanceCommandRepository, ReleaseInstanceRepository, ReleaseRepository,
+        SourceRepository,
     };
+    use crate::domain::artist::Artist;
     use crate::domain::candidate_match::CandidateMatch;
     use crate::domain::import_batch::{BatchRequester, ImportBatch, ImportBatchStatus, ImportMode};
     use crate::domain::ingest_evidence::{
@@ -1843,6 +2105,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialization_creates_canonical_release_rows() {
+        let batch_id = ImportBatchId::new();
+        let repository = InMemoryMatchingRepository::with_batch(batch_id.clone());
+        let provider = FakeMusicBrainzProvider::default();
+        let service = ReleaseMatchingService::new(repository.clone(), provider);
+
+        service
+            .score_and_persist_batch_matches(&batch_id, 140)
+            .await
+            .expect("candidate scoring should succeed");
+        let report = service
+            .materialize_batch_matches(&batch_id)
+            .await
+            .expect("materialization should succeed");
+
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.groups[0].release.title, "Kid A");
+        assert_eq!(report.groups[0].release_group.title, "Kid A");
+        assert_eq!(report.groups[0].artist.name, "Radiohead");
+        assert_eq!(
+            report.groups[0].release_instance.state,
+            ReleaseInstanceState::Matched
+        );
+        assert_eq!(repository.stored_artists().len(), 1);
+        assert_eq!(repository.stored_release_groups().len(), 1);
+        assert_eq!(repository.stored_releases().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn materialization_reuses_existing_release_identity() {
+        let batch_id = ImportBatchId::new();
+        let repository = InMemoryMatchingRepository::with_batch(batch_id.clone());
+        let provider = FakeMusicBrainzProvider::default();
+        let service = ReleaseMatchingService::new(repository.clone(), provider.clone());
+
+        service
+            .score_and_persist_batch_matches(&batch_id, 150)
+            .await
+            .expect("candidate scoring should succeed");
+        let first = service
+            .materialize_batch_matches(&batch_id)
+            .await
+            .expect("first materialization should succeed");
+        let second = ReleaseMatchingService::new(repository.clone(), provider)
+            .materialize_batch_matches(&batch_id)
+            .await
+            .expect("second materialization should succeed");
+
+        assert_eq!(first.groups.len(), 1);
+        assert!(second.groups.is_empty());
+        assert_eq!(repository.stored_releases().len(), 1);
+    }
+
+    #[tokio::test]
     async fn discogs_enrichment_persists_payloads_without_overriding_identity() {
         let batch_id = ImportBatchId::new();
         let repository = InMemoryMatchingRepository::with_batch(batch_id.clone());
@@ -1947,6 +2263,33 @@ mod tests {
             }];
             async move { Ok(items) }
         }
+
+        fn lookup_release(
+            &self,
+            release_id: &str,
+        ) -> impl Future<Output = Result<MusicBrainzReleaseDetail, String>> + Send {
+            let detail = MusicBrainzReleaseDetail {
+                id: release_id.to_string(),
+                title: "Kid A".to_string(),
+                country: Some("GB".to_string()),
+                date: Some("2000-10-02".to_string()),
+                artist_credit: vec![MusicBrainzArtistCredit {
+                    artist_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+                    artist_name: "Radiohead".to_string(),
+                    artist_sort_name: "Radiohead".to_string(),
+                }],
+                release_group: Some(MusicBrainzReleaseGroupRef {
+                    id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+                    title: "Kid A".to_string(),
+                    primary_type: Some("Album".to_string()),
+                }),
+                label_info: vec![MusicBrainzLabelInfo {
+                    catalog_number: Some("XLLP782".to_string()),
+                    label_name: Some("XL Recordings".to_string()),
+                }],
+            };
+            async move { Ok(detail) }
+        }
     }
 
     impl DiscogsMetadataProvider for FakeMusicBrainzProvider {
@@ -1976,6 +2319,9 @@ mod tests {
         source: Arc<Source>,
         manifests: Arc<Vec<StagingManifest>>,
         evidence: Arc<Vec<IngestEvidenceRecord>>,
+        artists: Arc<Mutex<Vec<Artist>>>,
+        release_groups: Arc<Mutex<Vec<ReleaseGroup>>>,
+        releases: Arc<Mutex<Vec<Release>>>,
         release_instances: Arc<Mutex<Vec<ReleaseInstance>>>,
         candidate_matches: Arc<Mutex<HashMap<ReleaseInstanceId, Vec<CandidateMatch>>>>,
         metadata_snapshots: Arc<Mutex<Vec<MetadataSnapshot>>>,
@@ -2052,6 +2398,9 @@ mod tests {
                 source: Arc::new(source),
                 manifests: Arc::new(vec![manifest]),
                 evidence: Arc::new(evidence),
+                artists: Arc::new(Mutex::new(Vec::new())),
+                release_groups: Arc::new(Mutex::new(Vec::new())),
+                releases: Arc::new(Mutex::new(Vec::new())),
                 release_instances: Arc::new(Mutex::new(Vec::new())),
                 candidate_matches: Arc::new(Mutex::new(HashMap::new())),
                 metadata_snapshots: Arc::new(Mutex::new(Vec::new())),
@@ -2097,6 +2446,21 @@ mod tests {
                 .cloned()
                 .collect()
         }
+
+        fn stored_artists(&self) -> Vec<Artist> {
+            self.artists.lock().expect("artists should lock").clone()
+        }
+
+        fn stored_release_groups(&self) -> Vec<ReleaseGroup> {
+            self.release_groups
+                .lock()
+                .expect("release groups should lock")
+                .clone()
+        }
+
+        fn stored_releases(&self) -> Vec<Release> {
+            self.releases.lock().expect("releases should lock").clone()
+        }
     }
 
     impl ImportBatchRepository for InMemoryMatchingRepository {
@@ -2112,6 +2476,131 @@ mod tests {
             _query: &crate::application::repository::ImportBatchListQuery,
         ) -> Result<crate::support::pagination::Page<ImportBatch>, RepositoryError> {
             unimplemented!("not needed in matching tests")
+        }
+    }
+
+    impl ReleaseRepository for InMemoryMatchingRepository {
+        fn find_artist_by_musicbrainz_id(
+            &self,
+            musicbrainz_artist_id: &str,
+        ) -> Result<Option<Artist>, RepositoryError> {
+            Ok(self
+                .artists
+                .lock()
+                .expect("artists should lock")
+                .iter()
+                .find(|artist| {
+                    artist
+                        .musicbrainz_artist_id
+                        .as_ref()
+                        .is_some_and(|id| id.as_uuid().to_string() == musicbrainz_artist_id)
+                })
+                .cloned())
+        }
+
+        fn get_release_group(
+            &self,
+            id: &crate::support::ids::ReleaseGroupId,
+        ) -> Result<Option<ReleaseGroup>, RepositoryError> {
+            Ok(self
+                .release_groups
+                .lock()
+                .expect("release groups should lock")
+                .iter()
+                .find(|group| group.id == *id)
+                .cloned())
+        }
+
+        fn find_release_group_by_musicbrainz_id(
+            &self,
+            musicbrainz_release_group_id: &str,
+        ) -> Result<Option<ReleaseGroup>, RepositoryError> {
+            Ok(self
+                .release_groups
+                .lock()
+                .expect("release groups should lock")
+                .iter()
+                .find(|group| {
+                    group
+                        .musicbrainz_release_group_id
+                        .as_ref()
+                        .is_some_and(|id| id.as_uuid().to_string() == musicbrainz_release_group_id)
+                })
+                .cloned())
+        }
+
+        fn get_release(
+            &self,
+            id: &crate::support::ids::ReleaseId,
+        ) -> Result<Option<Release>, RepositoryError> {
+            Ok(self
+                .releases
+                .lock()
+                .expect("releases should lock")
+                .iter()
+                .find(|release| release.id == *id)
+                .cloned())
+        }
+
+        fn find_release_by_musicbrainz_id(
+            &self,
+            musicbrainz_release_id: &str,
+        ) -> Result<Option<Release>, RepositoryError> {
+            Ok(self
+                .releases
+                .lock()
+                .expect("releases should lock")
+                .iter()
+                .find(|release| {
+                    release
+                        .musicbrainz_release_id
+                        .as_ref()
+                        .is_some_and(|id| id.as_uuid().to_string() == musicbrainz_release_id)
+                })
+                .cloned())
+        }
+
+        fn search_release_groups(
+            &self,
+            _query: &crate::application::repository::ReleaseGroupSearchQuery,
+        ) -> Result<Page<ReleaseGroup>, RepositoryError> {
+            unimplemented!("not needed in matching tests")
+        }
+
+        fn list_releases(
+            &self,
+            _query: &crate::application::repository::ReleaseListQuery,
+        ) -> Result<Page<Release>, RepositoryError> {
+            unimplemented!("not needed in matching tests")
+        }
+    }
+
+    impl ReleaseCommandRepository for InMemoryMatchingRepository {
+        fn create_artist(&self, artist: &Artist) -> Result<(), RepositoryError> {
+            self.artists
+                .lock()
+                .expect("artists should lock")
+                .push(artist.clone());
+            Ok(())
+        }
+
+        fn create_release_group(
+            &self,
+            release_group: &ReleaseGroup,
+        ) -> Result<(), RepositoryError> {
+            self.release_groups
+                .lock()
+                .expect("release groups should lock")
+                .push(release_group.clone());
+            Ok(())
+        }
+
+        fn create_release(&self, release: &Release) -> Result<(), RepositoryError> {
+            self.releases
+                .lock()
+                .expect("releases should lock")
+                .push(release.clone());
+            Ok(())
         }
     }
 

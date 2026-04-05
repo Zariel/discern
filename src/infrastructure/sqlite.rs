@@ -11,11 +11,13 @@ use crate::application::repository::{
     ImportBatchListQuery, ImportBatchRepository, IngestEvidenceCommandRepository,
     IngestEvidenceRepository, IssueCommandRepository, IssueListQuery, IssueRepository,
     JobCommandRepository, JobListQuery, JobRepository, MetadataSnapshotCommandRepository,
-    MetadataSnapshotRepository, ReleaseGroupSearchQuery, ReleaseInstanceCommandRepository,
-    ReleaseInstanceListQuery, ReleaseInstanceRepository, ReleaseListQuery, ReleaseRepository,
-    RepositoryError, RepositoryErrorKind, SourceCommandRepository, SourceRepository,
-    StagingManifestCommandRepository, StagingManifestRepository,
+    MetadataSnapshotRepository, ReleaseCommandRepository, ReleaseGroupSearchQuery,
+    ReleaseInstanceCommandRepository, ReleaseInstanceListQuery, ReleaseInstanceRepository,
+    ReleaseListQuery, ReleaseRepository, RepositoryError, RepositoryErrorKind,
+    SourceCommandRepository, SourceRepository, StagingManifestCommandRepository,
+    StagingManifestRepository,
 };
+use crate::domain::artist::Artist;
 use crate::domain::candidate_match::{
     CandidateMatch, CandidateProvider, CandidateScore, CandidateSubject, EvidenceKind,
     EvidenceNote, ProviderProvenance,
@@ -133,6 +135,23 @@ impl SqliteRepositories {
 }
 
 impl ReleaseRepository for SqliteRepositories {
+    fn find_artist_by_musicbrainz_id(
+        &self,
+        musicbrainz_artist_id: &str,
+    ) -> Result<Option<Artist>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        connection
+            .query_row(
+                "SELECT id, name, sort_name, musicbrainz_artist_id
+                 FROM artists
+                 WHERE musicbrainz_artist_id = ?1",
+                params![musicbrainz_artist_id],
+                map_artist,
+            )
+            .optional()
+            .map_err(to_storage_error)
+    }
+
     fn get_release_group(
         &self,
         id: &ReleaseGroupId,
@@ -144,6 +163,23 @@ impl ReleaseRepository for SqliteRepositories {
                  FROM release_groups
                  WHERE id = ?1",
                 params![id.as_uuid().to_string()],
+                map_release_group,
+            )
+            .optional()
+            .map_err(to_storage_error)
+    }
+
+    fn find_release_group_by_musicbrainz_id(
+        &self,
+        musicbrainz_release_group_id: &str,
+    ) -> Result<Option<ReleaseGroup>, RepositoryError> {
+        let connection = self.context.read_connection()?;
+        connection
+            .query_row(
+                "SELECT id, primary_artist_id, title, kind, musicbrainz_release_group_id
+                 FROM release_groups
+                 WHERE musicbrainz_release_group_id = ?1",
+                params![musicbrainz_release_group_id],
                 map_release_group,
             )
             .optional()
@@ -286,6 +322,103 @@ impl ReleaseRepository for SqliteRepositories {
             items,
             request: query.page,
             total: total as u64,
+        })
+    }
+}
+
+impl ReleaseCommandRepository for SqliteRepositories {
+    fn create_artist(&self, artist: &Artist) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO artists (id, name, sort_name, musicbrainz_artist_id)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        artist.id.as_uuid().to_string(),
+                        &artist.name,
+                        &artist.sort_name,
+                        artist
+                            .musicbrainz_artist_id
+                            .as_ref()
+                            .map(|value| value.as_uuid().to_string()),
+                    ],
+                )
+                .map_err(to_storage_error)?;
+            Ok(())
+        })
+    }
+
+    fn create_release_group(&self, release_group: &ReleaseGroup) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO release_groups
+                     (id, primary_artist_id, title, normalized_title, kind, musicbrainz_release_group_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        release_group.id.as_uuid().to_string(),
+                        release_group.primary_artist_id.as_uuid().to_string(),
+                        &release_group.title,
+                        release_group.title.to_lowercase(),
+                        release_group_kind_to_sql(&release_group.kind),
+                        release_group
+                            .musicbrainz_release_group_id
+                            .as_ref()
+                            .map(|value| value.as_uuid().to_string()),
+                    ],
+                )
+                .map_err(to_storage_error)?;
+            Ok(())
+        })
+    }
+
+    fn create_release(&self, release: &Release) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO releases
+                     (id, release_group_id, primary_artist_id, title, normalized_title,
+                      musicbrainz_release_id, discogs_release_id, edition_title, disambiguation,
+                      country, label, catalog_number, release_year, release_month, release_day)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    params![
+                        release.id.as_uuid().to_string(),
+                        release.release_group_id.as_uuid().to_string(),
+                        release.primary_artist_id.as_uuid().to_string(),
+                        &release.title,
+                        release.title.to_lowercase(),
+                        release
+                            .musicbrainz_release_id
+                            .as_ref()
+                            .map(|value| value.as_uuid().to_string()),
+                        release
+                            .discogs_release_id
+                            .as_ref()
+                            .map(|value| value.value()),
+                        &release.edition.edition_title,
+                        &release.edition.disambiguation,
+                        &release.edition.country,
+                        &release.edition.label,
+                        &release.edition.catalog_number,
+                        release
+                            .edition
+                            .release_date
+                            .as_ref()
+                            .map(|value| i64::from(value.year)),
+                        release
+                            .edition
+                            .release_date
+                            .as_ref()
+                            .and_then(|value| value.month.map(i64::from)),
+                        release
+                            .edition
+                            .release_date
+                            .as_ref()
+                            .and_then(|value| value.day.map(i64::from)),
+                    ],
+                )
+                .map_err(to_storage_error)?;
+            Ok(())
         })
     }
 }
@@ -1515,6 +1648,15 @@ fn map_release_group(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReleaseGroup> 
     })
 }
 
+fn map_artist(row: &rusqlite::Row<'_>) -> rusqlite::Result<Artist> {
+    Ok(Artist {
+        id: parse_uuid_id::<ArtistId>(row.get_ref(0)?, 0)?,
+        name: row.get(1)?,
+        sort_name: row.get(2)?,
+        musicbrainz_artist_id: parse_optional_mb_artist(row.get(3)?),
+    })
+}
+
 fn map_release(row: &rusqlite::Row<'_>) -> rusqlite::Result<Release> {
     let year = row.get::<_, Option<i64>>(11)?;
     let month = row.get::<_, Option<i64>>(12)?;
@@ -1860,6 +2002,12 @@ fn parse_optional_mb_release_group(raw: Option<String>) -> Option<MusicBrainzRel
     raw.and_then(|value| MusicBrainzReleaseGroupId::parse_str(&value).ok())
 }
 
+fn parse_optional_mb_artist(
+    raw: Option<String>,
+) -> Option<crate::support::ids::MusicBrainzArtistId> {
+    raw.and_then(|value| crate::support::ids::MusicBrainzArtistId::parse_str(&value).ok())
+}
+
 fn parse_optional_mb_release(raw: Option<String>) -> Option<MusicBrainzReleaseId> {
     raw.and_then(|value| MusicBrainzReleaseId::parse_str(&value).ok())
 }
@@ -1873,6 +2021,18 @@ fn parse_release_group_kind(value: String) -> ReleaseGroupKind {
         "compilation" => ReleaseGroupKind::Compilation,
         "soundtrack" => ReleaseGroupKind::Soundtrack,
         other => ReleaseGroupKind::Other(other.to_string()),
+    }
+}
+
+fn release_group_kind_to_sql(value: &ReleaseGroupKind) -> &str {
+    match value {
+        ReleaseGroupKind::Album => "album",
+        ReleaseGroupKind::Ep => "ep",
+        ReleaseGroupKind::Single => "single",
+        ReleaseGroupKind::Live => "live",
+        ReleaseGroupKind::Compilation => "compilation",
+        ReleaseGroupKind::Soundtrack => "soundtrack",
+        ReleaseGroupKind::Other(_) => "other",
     }
 }
 
@@ -2912,9 +3072,11 @@ mod tests {
     use crate::application::ingest::WatchDiscoveryService;
     use crate::application::repository::{
         ExportRepository, IngestEvidenceRepository, IssueRepository, JobCommandRepository,
-        JobRepository, MetadataSnapshotRepository, ReleaseInstanceCommandRepository,
-        ReleaseInstanceRepository, ReleaseRepository, StagingManifestRepository,
+        JobRepository, MetadataSnapshotRepository, ReleaseCommandRepository,
+        ReleaseInstanceCommandRepository, ReleaseInstanceRepository, ReleaseRepository,
+        StagingManifestRepository,
     };
+    use crate::domain::artist::Artist;
     use crate::domain::candidate_match::{
         CandidateMatch, CandidateProvider, CandidateScore, CandidateSubject, EvidenceKind,
         EvidenceNote, ProviderProvenance,
@@ -2922,6 +3084,8 @@ mod tests {
     use crate::domain::issue::{IssueState, IssueSubject, IssueType};
     use crate::domain::job::{JobStatus, JobSubject, JobTrigger, JobType};
     use crate::domain::metadata_snapshot::{MetadataSnapshotSource, SnapshotFormat};
+    use crate::domain::release::{PartialDate, Release, ReleaseEdition};
+    use crate::domain::release_group::{ReleaseGroup, ReleaseGroupKind};
     use crate::domain::release_instance::{
         BitrateMode, FormatFamily, IngestOrigin, ProvenanceSnapshot, ReleaseInstance,
         ReleaseInstanceState, TechnicalVariant,
@@ -3177,6 +3341,87 @@ mod tests {
             .expect("candidate matches should load");
         assert_eq!(stored_candidates.total, 1);
         assert_eq!(stored_candidates.items[0].normalized_score.value(), 0.88);
+    }
+
+    #[test]
+    fn repositories_create_and_lookup_canonical_release_rows() {
+        let (context, _path) = seeded_context();
+        let repositories = SqliteRepositories::new(context);
+        let artist = Artist {
+            id: ArtistId::new(),
+            name: "Boards of Canada".to_string(),
+            sort_name: Some("Boards of Canada".to_string()),
+            musicbrainz_artist_id: crate::support::ids::MusicBrainzArtistId::parse_str(
+                "11111111-1111-4111-8111-111111111111",
+            )
+            .ok(),
+        };
+        repositories
+            .create_artist(&artist)
+            .expect("artist should persist");
+
+        let release_group = ReleaseGroup {
+            id: ReleaseGroupId::new(),
+            primary_artist_id: artist.id.clone(),
+            title: "Music Has the Right to Children".to_string(),
+            kind: ReleaseGroupKind::Album,
+            musicbrainz_release_group_id:
+                crate::support::ids::MusicBrainzReleaseGroupId::parse_str(
+                    "22222222-2222-4222-8222-222222222222",
+                )
+                .ok(),
+        };
+        repositories
+            .create_release_group(&release_group)
+            .expect("release group should persist");
+
+        let release = Release {
+            id: ReleaseId::new(),
+            release_group_id: release_group.id.clone(),
+            primary_artist_id: artist.id.clone(),
+            title: "Music Has the Right to Children".to_string(),
+            musicbrainz_release_id: crate::support::ids::MusicBrainzReleaseId::parse_str(
+                "33333333-3333-4333-8333-333333333333",
+            )
+            .ok(),
+            discogs_release_id: None,
+            edition: ReleaseEdition {
+                edition_title: Some("Warp CD".to_string()),
+                disambiguation: None,
+                country: Some("GB".to_string()),
+                label: Some("Warp".to_string()),
+                catalog_number: Some("WARPCD55".to_string()),
+                release_date: Some(PartialDate {
+                    year: 1998,
+                    month: Some(4),
+                    day: Some(20),
+                }),
+            },
+        };
+        repositories
+            .create_release(&release)
+            .expect("release should persist");
+
+        let stored_artist = repositories
+            .find_artist_by_musicbrainz_id("11111111-1111-4111-8111-111111111111")
+            .expect("artist lookup should succeed")
+            .expect("artist should exist");
+        assert_eq!(stored_artist.name, "Boards of Canada");
+
+        let stored_group = repositories
+            .find_release_group_by_musicbrainz_id("22222222-2222-4222-8222-222222222222")
+            .expect("release group lookup should succeed")
+            .expect("release group should exist");
+        assert_eq!(stored_group.title, "Music Has the Right to Children");
+
+        let stored_release = repositories
+            .find_release_by_musicbrainz_id("33333333-3333-4333-8333-333333333333")
+            .expect("release lookup should succeed")
+            .expect("release should exist");
+        assert_eq!(
+            stored_release.edition.catalog_number.as_deref(),
+            Some("WARPCD55")
+        );
     }
 
     #[test]
