@@ -3313,24 +3313,6 @@ mod tests {
         connection
             .execute_batch(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/migrations/0004_manual_release_match_override.down.sql"
-            )))
-            .expect("manual override rollback should succeed");
-        connection
-            .execute_batch(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/migrations/0003_analyzer_output.down.sql"
-            )))
-            .expect("analyzer rollback should succeed");
-        connection
-            .execute_batch(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/migrations/0002_indexes.down.sql"
-            )))
-            .expect("index rollback should succeed");
-        connection
-            .execute_batch(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
                 "/migrations/0001_initial_schema.down.sql"
             )))
             .expect("schema rollback should succeed");
@@ -4113,24 +4095,6 @@ mod tests {
             .execute_batch(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/migrations/0001_initial_schema.up.sql"
-            )))
-            .map_err(to_storage_error)?;
-        transaction
-            .execute_batch(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/migrations/0002_indexes.up.sql"
-            )))
-            .map_err(to_storage_error)?;
-        transaction
-            .execute_batch(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/migrations/0003_analyzer_output.up.sql"
-            )))
-            .map_err(to_storage_error)?;
-        transaction
-            .execute_batch(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/migrations/0004_manual_release_match_override.up.sql"
             )))
             .map_err(to_storage_error)?;
         Ok(())

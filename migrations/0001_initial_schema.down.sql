@@ -5,6 +5,8 @@ DROP TABLE IF EXISTS jobs;
 DROP TABLE IF EXISTS issues;
 DROP TABLE IF EXISTS exported_metadata_snapshots;
 DROP TABLE IF EXISTS candidate_matches;
+DROP TABLE IF EXISTS ingest_evidence_records;
+DROP TABLE IF EXISTS staging_manifests;
 DROP TABLE IF EXISTS metadata_snapshots;
 DROP TABLE IF EXISTS files;
 DROP TABLE IF EXISTS track_instances;
