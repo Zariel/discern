@@ -1,7 +1,9 @@
+pub mod diagnostics;
 pub mod envelope;
 pub mod error;
 pub mod ingest;
 pub mod inspection;
+pub mod issues;
 pub mod jobs;
 pub mod pagination;
 pub mod review;
@@ -9,10 +11,12 @@ pub mod routes;
 
 use crate::config::ApiConfig;
 
+pub use diagnostics::DiagnosticsApi;
 pub use envelope::{ApiEnvelope, ApiMeta};
 pub use error::{ApiError, ApiErrorCode};
 pub use ingest::IngestApi;
 pub use inspection::InspectionApi;
+pub use issues::IssuesApi;
 pub use jobs::JobsApi;
 pub use pagination::ApiPaginationMeta;
 pub use review::ReviewApi;
