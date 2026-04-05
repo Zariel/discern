@@ -36,6 +36,7 @@ strong_id!(TrackInstanceId);
 strong_id!(FileId);
 strong_id!(SourceId);
 strong_id!(ImportBatchId);
+strong_id!(IngestEvidenceId);
 strong_id!(MetadataSnapshotId);
 strong_id!(CandidateMatchId);
 strong_id!(ExportedMetadataSnapshotId);
@@ -44,6 +45,7 @@ strong_id!(JobId);
 strong_id!(ManualOverrideId);
 strong_id!(ReleaseArtworkId);
 strong_id!(ConfigSnapshotId);
+strong_id!(StagingManifestId);
 
 strong_id!(MusicBrainzArtistId);
 strong_id!(MusicBrainzReleaseGroupId);

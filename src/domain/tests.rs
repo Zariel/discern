@@ -8,6 +8,10 @@ use crate::domain::exported_metadata_snapshot::{
 };
 use crate::domain::file::{FileRecord, FileRole};
 use crate::domain::import_batch::{BatchRequester, ImportBatch, ImportBatchStatus, ImportMode};
+use crate::domain::ingest_evidence::{
+    IngestEvidenceRecord, IngestEvidenceSource, IngestEvidenceSubject, ObservedValue,
+    ObservedValueKind,
+};
 use crate::domain::issue::{Issue, IssueState, IssueSubject, IssueType};
 use crate::domain::job::{Job, JobStatus, JobSubject, JobTrigger, JobType, RetryScope};
 use crate::domain::manual_override::{ManualOverride, OverrideField, OverrideSubject};
@@ -19,12 +23,17 @@ use crate::domain::release_instance::{
     ReleaseInstanceState, TechnicalVariant,
 };
 use crate::domain::source::{Source, SourceKind, SourceLocator};
+use crate::domain::staging_manifest::{
+    AuxiliaryFile, AuxiliaryFileRole, FileFingerprint, GroupingDecision, GroupingStrategy,
+    ObservedTag, StagedFile, StagedReleaseGroup, StagingManifest, StagingManifestSource,
+};
 use crate::domain::track::{Track, TrackPosition};
 use crate::domain::track_instance::{AudioProperties, TrackInstance};
 use crate::support::ids::{
     ArtistId, CandidateMatchId, ConfigSnapshotId, ExportedMetadataSnapshotId, FileId,
-    ImportBatchId, IssueId, JobId, ManualOverrideId, ReleaseArtworkId, ReleaseGroupId, ReleaseId,
-    ReleaseInstanceId, SourceId, TrackId, TrackInstanceId,
+    ImportBatchId, IngestEvidenceId, IssueId, JobId, ManualOverrideId, ReleaseArtworkId,
+    ReleaseGroupId, ReleaseId, ReleaseInstanceId, SourceId, StagingManifestId, TrackId,
+    TrackInstanceId,
 };
 
 #[test]
@@ -343,4 +352,95 @@ fn jobs_follow_queue_and_retry_lifecycle() {
     assert_eq!(job.status, JobStatus::Queued);
     assert_eq!(job.progress_phase, "rematch".to_string());
     assert_eq!(job.retry_count, 1);
+}
+
+#[test]
+fn staging_manifest_keeps_ingest_observations_precanonical() {
+    let batch_id = ImportBatchId::new();
+    let manifest = StagingManifest {
+        id: StagingManifestId::new(),
+        batch_id: batch_id.clone(),
+        source: StagingManifestSource {
+            kind: SourceKind::WatchDirectory,
+            source_path: "/srv/import/lossless/radiohead".into(),
+        },
+        discovered_files: vec![StagedFile {
+            path: "/srv/import/lossless/radiohead/01 - Everything in Its Right Place.flac".into(),
+            fingerprint: FileFingerprint::LightweightFingerprint("fp:track-01".to_string()),
+            observed_tags: vec![
+                ObservedTag {
+                    key: "ALBUM".to_string(),
+                    value: "Kid A".to_string(),
+                },
+                ObservedTag {
+                    key: "ARTIST".to_string(),
+                    value: "Radiohead".to_string(),
+                },
+            ],
+            duration_ms: Some(251_000),
+            format_family: FormatFamily::Flac,
+        }],
+        auxiliary_files: vec![AuxiliaryFile {
+            path: "/srv/import/lossless/radiohead/release.yaml".into(),
+            role: AuxiliaryFileRole::GazelleYaml,
+        }],
+        grouping: GroupingDecision {
+            strategy: GroupingStrategy::CommonParentDirectory,
+            groups: vec![StagedReleaseGroup {
+                key: "radiohead-kid-a".to_string(),
+                file_paths: vec![
+                    "/srv/import/lossless/radiohead/01 - Everything in Its Right Place.flac".into(),
+                ],
+                auxiliary_paths: vec!["/srv/import/lossless/radiohead/release.yaml".into()],
+            }],
+            notes: vec!["single album directory".to_string()],
+        },
+        captured_at_unix_seconds: 1_712_288_700,
+    };
+
+    assert_eq!(manifest.batch_id, batch_id);
+    assert_eq!(manifest.discovered_files.len(), 1);
+    assert_eq!(manifest.auxiliary_files.len(), 1);
+    assert_eq!(manifest.grouping.groups[0].key, "radiohead-kid-a");
+}
+
+#[test]
+fn ingest_evidence_records_support_analyzer_inputs_without_identity_assignment() {
+    let batch_id = ImportBatchId::new();
+    let evidence = IngestEvidenceRecord {
+        id: IngestEvidenceId::new(),
+        batch_id: batch_id.clone(),
+        subject: IngestEvidenceSubject::GroupedReleaseInput {
+            group_key: "radiohead-kid-a".to_string(),
+        },
+        source: IngestEvidenceSource::GazelleYaml,
+        observations: vec![
+            ObservedValue {
+                kind: ObservedValueKind::Artist,
+                value: "Radiohead".to_string(),
+            },
+            ObservedValue {
+                kind: ObservedValueKind::ReleaseTitle,
+                value: "Kid A".to_string(),
+            },
+            ObservedValue::format_family(FormatFamily::Flac),
+        ],
+        structured_payload: Some("release_name: Kid A".to_string()),
+        captured_at_unix_seconds: 1_712_288_701,
+    };
+
+    assert_eq!(evidence.batch_id, batch_id);
+    assert!(matches!(
+        evidence.subject,
+        IngestEvidenceSubject::GroupedReleaseInput { .. }
+    ));
+    assert_eq!(evidence.source, IngestEvidenceSource::GazelleYaml);
+    assert_eq!(evidence.observations.len(), 3);
+    assert_eq!(
+        evidence.observations[2],
+        ObservedValue {
+            kind: ObservedValueKind::FormatFamily,
+            value: "flac".to_string(),
+        }
+    );
 }
