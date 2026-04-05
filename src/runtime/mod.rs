@@ -35,7 +35,8 @@ pub fn bootstrap(config: AppConfig) -> Result<Runtime, RuntimeBootstrapError> {
         .validate_startup()
         .map_err(RuntimeBootstrapError::InvalidConfig)?;
 
-    let infrastructure = Infrastructure::from_config(&config.storage);
+    let infrastructure =
+        Infrastructure::from_config(&config.storage, &config.providers.musicbrainz);
 
     Ok(Runtime {
         application: ApplicationContext::new(&config),
