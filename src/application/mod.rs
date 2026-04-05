@@ -6,6 +6,7 @@ pub mod issues;
 pub mod jobs;
 pub mod matching;
 pub mod organize;
+pub mod pipeline;
 pub mod repository;
 pub mod services;
 pub mod tagging;
