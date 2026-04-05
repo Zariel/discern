@@ -10,6 +10,9 @@ use crate::application::repository::{
 use crate::domain::import_batch::{BatchRequester, ImportBatch, ImportBatchStatus};
 use crate::domain::job::{Job, JobSubject, JobTrigger, JobType};
 use crate::domain::source::{Source, SourceKind, SourceLocator};
+use crate::domain::staging_manifest::{
+    AuxiliaryFile, AuxiliaryFileRole, GroupingDecision, GroupingStrategy, StagedReleaseGroup,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchDiscoveryError {
@@ -37,6 +40,12 @@ pub struct IngestSubmissionReport {
     pub source: Source,
     pub batch: ImportBatch,
     pub job: Job,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupedReleaseInputs {
+    pub decision: GroupingDecision,
+    pub auxiliary_files: Vec<AuxiliaryFile>,
 }
 
 pub struct WatchDiscoveryService<R> {
@@ -371,6 +380,218 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+pub fn group_release_inputs(
+    submitted_paths: &[PathBuf],
+    supported_formats: &[crate::domain::release_instance::FormatFamily],
+) -> Result<GroupedReleaseInputs, WatchDiscoveryError> {
+    let mut groups = Vec::new();
+    let mut auxiliary_files = Vec::new();
+    let mut loose_files_by_parent = std::collections::BTreeMap::<PathBuf, Vec<PathBuf>>::new();
+    let mut notes = Vec::new();
+
+    for submitted_path in submitted_paths {
+        let metadata = fs::metadata(submitted_path).map_err(|error| WatchDiscoveryError {
+            kind: if error.kind() == std::io::ErrorKind::NotFound {
+                WatchDiscoveryErrorKind::NotFound
+            } else {
+                WatchDiscoveryErrorKind::Io
+            },
+            message: format!("failed to inspect {}: {error}", submitted_path.display()),
+        })?;
+
+        if metadata.is_dir() {
+            let (audio_files, aux_files) =
+                collect_directory_contents(submitted_path, supported_formats)?;
+            auxiliary_files.extend(aux_files.clone());
+            if !audio_files.is_empty() {
+                groups.push(StagedReleaseGroup {
+                    key: group_key_for_path(submitted_path),
+                    file_paths: audio_files,
+                    auxiliary_paths: aux_files.into_iter().map(|file| file.path).collect(),
+                });
+            }
+        } else if metadata.is_file() && is_supported_audio_file(submitted_path, supported_formats) {
+            let parent = submitted_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            loose_files_by_parent
+                .entry(parent)
+                .or_default()
+                .push(normalize_path(submitted_path));
+        }
+    }
+
+    let mut loose_groups = Vec::new();
+    for (parent, mut files) in loose_files_by_parent {
+        files.sort();
+        if files.len() == 1 || track_numbers_are_contiguous(&files) {
+            let aux_files = collect_nearby_auxiliary_files(&parent)?;
+            auxiliary_files.extend(aux_files.clone());
+            loose_groups.push(StagedReleaseGroup {
+                key: group_key_for_path(&parent),
+                file_paths: files,
+                auxiliary_paths: aux_files.into_iter().map(|file| file.path).collect(),
+            });
+        } else {
+            notes.push(format!(
+                "split ambiguous loose files under {} into one-file groups",
+                parent.display()
+            ));
+            for file in files {
+                loose_groups.push(StagedReleaseGroup {
+                    key: group_key_for_path(&file),
+                    file_paths: vec![file],
+                    auxiliary_paths: Vec::new(),
+                });
+            }
+        }
+    }
+
+    let strategy = if !groups.is_empty() {
+        GroupingStrategy::CommonParentDirectory
+    } else {
+        GroupingStrategy::TrackNumberContinuity
+    };
+    groups.extend(loose_groups);
+
+    Ok(GroupedReleaseInputs {
+        decision: GroupingDecision {
+            strategy,
+            groups,
+            notes,
+        },
+        auxiliary_files,
+    })
+}
+
+fn collect_directory_contents(
+    directory: &Path,
+    supported_formats: &[crate::domain::release_instance::FormatFamily],
+) -> Result<(Vec<PathBuf>, Vec<AuxiliaryFile>), WatchDiscoveryError> {
+    let mut audio_files = Vec::new();
+    let mut auxiliary_files = Vec::new();
+    let entries = fs::read_dir(directory).map_err(|error| WatchDiscoveryError {
+        kind: WatchDiscoveryErrorKind::Io,
+        message: format!("failed to scan {}: {error}", directory.display()),
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| WatchDiscoveryError {
+            kind: WatchDiscoveryErrorKind::Io,
+            message: format!("failed to scan {}: {error}", directory.display()),
+        })?;
+        let path = entry.path();
+        if is_hidden(&path) {
+            continue;
+        }
+
+        let file_type = entry.file_type().map_err(|error| WatchDiscoveryError {
+            kind: WatchDiscoveryErrorKind::Io,
+            message: format!("failed to inspect {}: {error}", path.display()),
+        })?;
+        if file_type.is_file() {
+            if is_supported_audio_file(&path, supported_formats) {
+                audio_files.push(normalize_path(&path));
+            } else if let Some(role) = classify_auxiliary_file(&path) {
+                auxiliary_files.push(AuxiliaryFile {
+                    path: normalize_path(&path),
+                    role,
+                });
+            }
+        }
+    }
+
+    audio_files.sort();
+    auxiliary_files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((audio_files, auxiliary_files))
+}
+
+fn collect_nearby_auxiliary_files(
+    directory: &Path,
+) -> Result<Vec<AuxiliaryFile>, WatchDiscoveryError> {
+    let entries = fs::read_dir(directory).map_err(|error| WatchDiscoveryError {
+        kind: WatchDiscoveryErrorKind::Io,
+        message: format!("failed to scan {}: {error}", directory.display()),
+    })?;
+    let mut auxiliary_files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| WatchDiscoveryError {
+            kind: WatchDiscoveryErrorKind::Io,
+            message: format!("failed to scan {}: {error}", directory.display()),
+        })?;
+        let path = entry.path();
+        if is_hidden(&path) {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| WatchDiscoveryError {
+            kind: WatchDiscoveryErrorKind::Io,
+            message: format!("failed to inspect {}: {error}", path.display()),
+        })?;
+        if file_type.is_file()
+            && let Some(role) = classify_auxiliary_file(&path)
+        {
+            auxiliary_files.push(AuxiliaryFile {
+                path: normalize_path(&path),
+                role,
+            });
+        }
+    }
+    auxiliary_files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(auxiliary_files)
+}
+
+fn classify_auxiliary_file(path: &Path) -> Option<AuxiliaryFileRole> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())?
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "yaml" | "yml" => Some(AuxiliaryFileRole::GazelleYaml),
+        "jpg" | "jpeg" | "png" => Some(AuxiliaryFileRole::Artwork),
+        "cue" => Some(AuxiliaryFileRole::CueSheet),
+        "log" => Some(AuxiliaryFileRole::Log),
+        _ => None,
+    }
+}
+
+fn track_numbers_are_contiguous(files: &[PathBuf]) -> bool {
+    let mut numbers = files
+        .iter()
+        .filter_map(|path| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .and_then(parse_leading_track_number)
+        })
+        .collect::<Vec<_>>();
+    if numbers.len() != files.len() {
+        return false;
+    }
+    numbers.sort_unstable();
+    numbers
+        .windows(2)
+        .all(|window| matches!(window, [left, right] if *right == *left + 1))
+}
+
+fn parse_leading_track_number(stem: &str) -> Option<u32> {
+    let digits = stem
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+fn group_key_for_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("group")
+        .to_ascii_lowercase()
+}
+
 fn map_repository_error(error: RepositoryError) -> WatchDiscoveryError {
     let kind = match error.kind {
         RepositoryErrorKind::NotFound => WatchDiscoveryErrorKind::NotFound,
@@ -543,6 +764,79 @@ mod tests {
             vec![PathBuf::from("/imports/manual/drop")]
         );
         assert_eq!(report.job.triggered_by, JobTrigger::Operator);
+    }
+
+    #[test]
+    fn grouping_uses_directory_boundaries_when_album_folders_are_clear() {
+        let temp_root = test_root("group-dirs");
+        fs::create_dir_all(temp_root.join("album-a")).expect("album a should be created");
+        fs::create_dir_all(temp_root.join("album-b")).expect("album b should be created");
+        fs::write(temp_root.join("album-a").join("01.flac"), b"flac").expect("track should exist");
+        fs::write(temp_root.join("album-a").join("cover.jpg"), b"jpg").expect("cover should exist");
+        fs::write(temp_root.join("album-b").join("01.mp3"), b"mp3").expect("track should exist");
+        fs::write(temp_root.join("album-b").join("release.yaml"), b"yaml")
+            .expect("yaml should exist");
+
+        let grouped = group_release_inputs(
+            &[temp_root.join("album-a"), temp_root.join("album-b")],
+            &crate::config::AppConfig::default().import.supported_formats,
+        )
+        .expect("grouping should succeed");
+
+        assert_eq!(
+            grouped.decision.strategy,
+            GroupingStrategy::CommonParentDirectory
+        );
+        assert_eq!(grouped.decision.groups.len(), 2);
+        assert_eq!(grouped.auxiliary_files.len(), 2);
+
+        cleanup_root(temp_root);
+    }
+
+    #[test]
+    fn grouping_keeps_contiguous_loose_tracks_together() {
+        let temp_root = test_root("group-loose");
+        fs::create_dir_all(&temp_root).expect("root should be created");
+        fs::write(temp_root.join("01 Intro.flac"), b"flac").expect("track should exist");
+        fs::write(temp_root.join("02 Song.flac"), b"flac").expect("track should exist");
+        fs::write(temp_root.join("cover.jpg"), b"jpg").expect("cover should exist");
+
+        let grouped = group_release_inputs(
+            &[
+                temp_root.join("01 Intro.flac"),
+                temp_root.join("02 Song.flac"),
+            ],
+            &crate::config::AppConfig::default().import.supported_formats,
+        )
+        .expect("grouping should succeed");
+
+        assert_eq!(grouped.decision.groups.len(), 1);
+        assert_eq!(grouped.decision.groups[0].file_paths.len(), 2);
+        assert_eq!(grouped.auxiliary_files.len(), 1);
+
+        cleanup_root(temp_root);
+    }
+
+    #[test]
+    fn grouping_splits_ambiguous_loose_tracks_instead_of_merging() {
+        let temp_root = test_root("group-ambiguous");
+        fs::create_dir_all(&temp_root).expect("root should be created");
+        fs::write(temp_root.join("01 Intro.flac"), b"flac").expect("track should exist");
+        fs::write(temp_root.join("07 Other.flac"), b"flac").expect("track should exist");
+
+        let grouped = group_release_inputs(
+            &[
+                temp_root.join("01 Intro.flac"),
+                temp_root.join("07 Other.flac"),
+            ],
+            &crate::config::AppConfig::default().import.supported_formats,
+        )
+        .expect("grouping should succeed");
+
+        assert_eq!(grouped.decision.groups.len(), 2);
+        assert_eq!(grouped.decision.notes.len(), 1);
+
+        cleanup_root(temp_root);
     }
 
     #[derive(Clone, Default)]
