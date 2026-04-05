@@ -2,17 +2,25 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use id3::TagLike;
+use serde_yaml::Value as YamlValue;
+
 use crate::application::config::{ValidatedRuntimeConfig, WatchDirectoryPolicy};
 use crate::application::repository::{
     ImportBatchCommandRepository, JobCommandRepository, RepositoryError, RepositoryErrorKind,
     SourceCommandRepository, SourceRepository,
 };
 use crate::domain::import_batch::{BatchRequester, ImportBatch, ImportBatchStatus};
+use crate::domain::ingest_evidence::{
+    IngestEvidenceRecord, IngestEvidenceSource, IngestEvidenceSubject, ObservedValue,
+    ObservedValueKind,
+};
 use crate::domain::job::{Job, JobSubject, JobTrigger, JobType};
 use crate::domain::source::{Source, SourceKind, SourceLocator};
 use crate::domain::staging_manifest::{
     AuxiliaryFile, AuxiliaryFileRole, GroupingDecision, GroupingStrategy, StagedReleaseGroup,
 };
+use crate::support::ids::ImportBatchId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchDiscoveryError {
@@ -46,6 +54,11 @@ pub struct IngestSubmissionReport {
 pub struct GroupedReleaseInputs {
     pub decision: GroupingDecision,
     pub auxiliary_files: Vec<AuxiliaryFile>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtractedIngestEvidence {
+    pub records: Vec<IngestEvidenceRecord>,
 }
 
 pub struct WatchDiscoveryService<R> {
@@ -465,6 +478,234 @@ pub fn group_release_inputs(
     })
 }
 
+pub fn extract_group_evidence(
+    batch_id: &ImportBatchId,
+    grouped: &GroupedReleaseInputs,
+    captured_at_unix_seconds: i64,
+) -> Result<ExtractedIngestEvidence, WatchDiscoveryError> {
+    let mut records = Vec::new();
+
+    for group in &grouped.decision.groups {
+        for file_path in &group.file_paths {
+            records.push(extract_audio_file_evidence(
+                batch_id,
+                file_path,
+                captured_at_unix_seconds,
+            )?);
+        }
+
+        for auxiliary_path in &group.auxiliary_paths {
+            if classify_auxiliary_file(auxiliary_path) == Some(AuxiliaryFileRole::GazelleYaml) {
+                records.push(parse_gazelle_yaml_evidence(
+                    batch_id,
+                    &group.key,
+                    auxiliary_path,
+                    captured_at_unix_seconds,
+                )?);
+            }
+        }
+    }
+
+    Ok(ExtractedIngestEvidence { records })
+}
+
+fn extract_audio_file_evidence(
+    batch_id: &ImportBatchId,
+    file_path: &Path,
+    captured_at_unix_seconds: i64,
+) -> Result<IngestEvidenceRecord, WatchDiscoveryError> {
+    let format = infer_format_family(file_path).ok_or_else(|| WatchDiscoveryError {
+        kind: WatchDiscoveryErrorKind::Conflict,
+        message: format!("unsupported audio format for {}", file_path.display()),
+    })?;
+
+    let mut observations = vec![ObservedValue::format_family(format.clone())];
+    match format {
+        crate::domain::release_instance::FormatFamily::Mp3 => {
+            let tag = id3::Tag::read_from_path(file_path).map_err(|error| WatchDiscoveryError {
+                kind: WatchDiscoveryErrorKind::Io,
+                message: format!(
+                    "failed to read MP3 tags from {}: {error}",
+                    file_path.display()
+                ),
+            })?;
+            observations.extend(observations_from_id3_tag(&tag));
+        }
+        crate::domain::release_instance::FormatFamily::Flac => {
+            let tag =
+                metaflac::Tag::read_from_path(file_path).map_err(|error| WatchDiscoveryError {
+                    kind: WatchDiscoveryErrorKind::Io,
+                    message: format!(
+                        "failed to read FLAC tags from {}: {error}",
+                        file_path.display()
+                    ),
+                })?;
+            if let Some(vorbis) = tag.vorbis_comments() {
+                observations.extend(observations_from_vorbis_comments(
+                    vorbis.comments.iter().flat_map(|(key, values)| {
+                        values
+                            .iter()
+                            .cloned()
+                            .map(|value| (key.clone(), value))
+                            .collect::<Vec<_>>()
+                    }),
+                ));
+            }
+        }
+    }
+
+    Ok(IngestEvidenceRecord {
+        id: crate::support::ids::IngestEvidenceId::new(),
+        batch_id: batch_id.clone(),
+        subject: IngestEvidenceSubject::DiscoveredPath(normalize_path(file_path)),
+        source: IngestEvidenceSource::EmbeddedTags,
+        observations,
+        structured_payload: None,
+        captured_at_unix_seconds,
+    })
+}
+
+fn parse_gazelle_yaml_evidence(
+    batch_id: &ImportBatchId,
+    group_key: &str,
+    yaml_path: &Path,
+    captured_at_unix_seconds: i64,
+) -> Result<IngestEvidenceRecord, WatchDiscoveryError> {
+    let payload = fs::read_to_string(yaml_path).map_err(|error| WatchDiscoveryError {
+        kind: WatchDiscoveryErrorKind::Io,
+        message: format!("failed to read YAML from {}: {error}", yaml_path.display()),
+    })?;
+    let document: YamlValue =
+        serde_yaml::from_str(&payload).map_err(|error| WatchDiscoveryError {
+            kind: WatchDiscoveryErrorKind::Conflict,
+            message: format!("failed to parse YAML from {}: {error}", yaml_path.display()),
+        })?;
+
+    let mut observations = Vec::new();
+    for (field, kind) in [
+        ("release_name", ObservedValueKind::ReleaseTitle),
+        ("artist", ObservedValueKind::Artist),
+        ("year", ObservedValueKind::ReleaseYear),
+        ("media", ObservedValueKind::MediaDescriptor),
+        ("source", ObservedValueKind::SourceDescriptor),
+        ("format", ObservedValueKind::FormatFamily),
+        ("encoding", ObservedValueKind::FormatFamily),
+        ("scene", ObservedValueKind::TrackerIdentifier),
+        ("tracker_id", ObservedValueKind::TrackerIdentifier),
+        ("torrent_id", ObservedValueKind::TrackerIdentifier),
+    ] {
+        if let Some(value) = yaml_string_field(&document, field) {
+            observations.push(ObservedValue {
+                kind: kind.clone(),
+                value,
+            });
+        }
+    }
+
+    Ok(IngestEvidenceRecord {
+        id: crate::support::ids::IngestEvidenceId::new(),
+        batch_id: batch_id.clone(),
+        subject: IngestEvidenceSubject::GroupedReleaseInput {
+            group_key: group_key.to_string(),
+        },
+        source: IngestEvidenceSource::GazelleYaml,
+        observations,
+        structured_payload: Some(payload),
+        captured_at_unix_seconds,
+    })
+}
+
+fn observations_from_id3_tag(tag: &id3::Tag) -> Vec<ObservedValue> {
+    let mut observations = Vec::new();
+    push_optional_observation(
+        &mut observations,
+        ObservedValueKind::Artist,
+        tag.artist().map(str::to_string),
+    );
+    push_optional_observation(
+        &mut observations,
+        ObservedValueKind::ReleaseTitle,
+        tag.album().map(str::to_string),
+    );
+    push_optional_observation(
+        &mut observations,
+        ObservedValueKind::TrackTitle,
+        tag.title().map(str::to_string),
+    );
+    push_optional_observation(
+        &mut observations,
+        ObservedValueKind::TrackNumber,
+        tag.track().map(|value| value.to_string()),
+    );
+    push_optional_observation(
+        &mut observations,
+        ObservedValueKind::DiscNumber,
+        tag.disc().map(|value| value.to_string()),
+    );
+    push_optional_observation(
+        &mut observations,
+        ObservedValueKind::ReleaseYear,
+        tag.year().map(|value| value.to_string()),
+    );
+    observations
+}
+
+fn observations_from_vorbis_comments(
+    comments: impl IntoIterator<Item = (String, String)>,
+) -> Vec<ObservedValue> {
+    let mut observations = Vec::new();
+    for (key, value) in comments {
+        let normalized_key = key.to_ascii_lowercase();
+        let kind = match normalized_key.as_str() {
+            "artist" | "albumartist" => Some(ObservedValueKind::Artist),
+            "album" => Some(ObservedValueKind::ReleaseTitle),
+            "title" => Some(ObservedValueKind::TrackTitle),
+            "tracknumber" => Some(ObservedValueKind::TrackNumber),
+            "discnumber" => Some(ObservedValueKind::DiscNumber),
+            "date" | "year" => Some(ObservedValueKind::ReleaseYear),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            observations.push(ObservedValue { kind, value });
+        }
+    }
+    observations
+}
+
+fn infer_format_family(path: &Path) -> Option<crate::domain::release_instance::FormatFamily> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "flac" => Some(crate::domain::release_instance::FormatFamily::Flac),
+        "mp3" => Some(crate::domain::release_instance::FormatFamily::Mp3),
+        _ => None,
+    }
+}
+
+fn yaml_string_field(document: &YamlValue, field: &str) -> Option<String> {
+    match document {
+        YamlValue::Mapping(map) => {
+            map.get(YamlValue::String(field.to_string()))
+                .and_then(|value| match value {
+                    YamlValue::String(text) => Some(text.clone()),
+                    YamlValue::Number(number) => Some(number.to_string()),
+                    YamlValue::Bool(boolean) => Some(boolean.to_string()),
+                    _ => None,
+                })
+        }
+        _ => None,
+    }
+}
+
+fn push_optional_observation(
+    observations: &mut Vec<ObservedValue>,
+    kind: ObservedValueKind,
+    value: impl Into<Option<String>>,
+) {
+    if let Some(value) = value.into() {
+        observations.push(ObservedValue { kind, value });
+    }
+}
+
 fn collect_directory_contents(
     directory: &Path,
     supported_formats: &[crate::domain::release_instance::FormatFamily],
@@ -835,6 +1076,95 @@ mod tests {
 
         assert_eq!(grouped.decision.groups.len(), 2);
         assert_eq!(grouped.decision.notes.len(), 1);
+
+        cleanup_root(temp_root);
+    }
+
+    #[test]
+    fn id3_mapping_extracts_day_one_fields() {
+        let mut tag = id3::Tag::new();
+        tag.set_artist("Radiohead");
+        tag.set_album("Kid A");
+        tag.set_title("Everything in Its Right Place");
+        tag.set_track(1);
+        tag.set_disc(1);
+        tag.set_year(2000);
+
+        let observations = observations_from_id3_tag(&tag);
+
+        assert!(observations.iter().any(|value| {
+            value.kind == ObservedValueKind::Artist && value.value == "Radiohead"
+        }));
+        assert!(observations.iter().any(|value| {
+            value.kind == ObservedValueKind::ReleaseTitle && value.value == "Kid A"
+        }));
+        assert!(
+            observations.iter().any(|value| {
+                value.kind == ObservedValueKind::TrackNumber && value.value == "1"
+            })
+        );
+    }
+
+    #[test]
+    fn vorbis_mapping_extracts_supported_fields() {
+        let observations = observations_from_vorbis_comments(vec![
+            ("ARTIST".to_string(), "Radiohead".to_string()),
+            ("ALBUM".to_string(), "Kid A".to_string()),
+            ("TRACKNUMBER".to_string(), "1".to_string()),
+            ("DATE".to_string(), "2000".to_string()),
+        ]);
+
+        assert_eq!(observations.len(), 4);
+        assert!(observations.iter().any(|value| {
+            value.kind == ObservedValueKind::ReleaseYear && value.value == "2000"
+        }));
+    }
+
+    #[test]
+    fn gazelle_yaml_parser_keeps_structured_supporting_evidence() {
+        let temp_root = test_root("yaml");
+        fs::create_dir_all(&temp_root).expect("root should be created");
+        let yaml_path = temp_root.join("release.yaml");
+        fs::write(
+            &yaml_path,
+            "release_name: Kid A\nartist: Radiohead\nyear: 2000\nmedia: CD\ntracker_id: 1234\n",
+        )
+        .expect("yaml should be written");
+
+        let record =
+            parse_gazelle_yaml_evidence(&ImportBatchId::new(), "radiohead-kid-a", &yaml_path, 400)
+                .expect("yaml parsing should succeed");
+
+        assert_eq!(record.source, IngestEvidenceSource::GazelleYaml);
+        assert!(record.structured_payload.is_some());
+        assert!(record.observations.iter().any(|value| {
+            value.kind == ObservedValueKind::ReleaseTitle && value.value == "Kid A"
+        }));
+
+        cleanup_root(temp_root);
+    }
+
+    #[test]
+    fn mp3_extraction_reads_embedded_id3_tags() {
+        let temp_root = test_root("mp3-tags");
+        fs::create_dir_all(&temp_root).expect("root should be created");
+        let mp3_path = temp_root.join("01-test.mp3");
+        fs::write(&mp3_path, b"").expect("mp3 placeholder should exist");
+
+        let mut tag = id3::Tag::new();
+        tag.set_artist("Radiohead");
+        tag.set_album("Kid A");
+        tag.set_title("Everything in Its Right Place");
+        tag.write_to_path(&mp3_path, id3::Version::Id3v24)
+            .expect("id3 tag should be written");
+
+        let record = extract_audio_file_evidence(&ImportBatchId::new(), &mp3_path, 401)
+            .expect("mp3 evidence extraction should succeed");
+
+        assert_eq!(record.source, IngestEvidenceSource::EmbeddedTags);
+        assert!(record.observations.iter().any(|value| {
+            value.kind == ObservedValueKind::Artist && value.value == "Radiohead"
+        }));
 
         cleanup_root(temp_root);
     }
