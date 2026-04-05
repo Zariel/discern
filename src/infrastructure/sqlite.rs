@@ -7,16 +7,16 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
 use crate::application::repository::{
-    ExportRepository, ExportedMetadataListQuery, ImportBatchCommandRepository,
-    ImportBatchListQuery, ImportBatchRepository, IngestEvidenceCommandRepository,
-    IngestEvidenceRepository, IssueCommandRepository, IssueListQuery, IssueRepository,
-    JobCommandRepository, JobListQuery, JobRepository, ManualOverrideCommandRepository,
-    ManualOverrideListQuery, ManualOverrideRepository, MetadataSnapshotCommandRepository,
-    MetadataSnapshotRepository, ReleaseCommandRepository, ReleaseGroupSearchQuery,
-    ReleaseInstanceCommandRepository, ReleaseInstanceListQuery, ReleaseInstanceRepository,
-    ReleaseListQuery, ReleaseRepository, RepositoryError, RepositoryErrorKind,
-    SourceCommandRepository, SourceRepository, StagingManifestCommandRepository,
-    StagingManifestRepository,
+    ExportCommandRepository, ExportRepository, ExportedMetadataListQuery,
+    ImportBatchCommandRepository, ImportBatchListQuery, ImportBatchRepository,
+    IngestEvidenceCommandRepository, IngestEvidenceRepository, IssueCommandRepository,
+    IssueListQuery, IssueRepository, JobCommandRepository, JobListQuery, JobRepository,
+    ManualOverrideCommandRepository, ManualOverrideListQuery, ManualOverrideRepository,
+    MetadataSnapshotCommandRepository, MetadataSnapshotRepository, ReleaseCommandRepository,
+    ReleaseGroupSearchQuery, ReleaseInstanceCommandRepository, ReleaseInstanceListQuery,
+    ReleaseInstanceRepository, ReleaseListQuery, ReleaseRepository, RepositoryError,
+    RepositoryErrorKind, SourceCommandRepository, SourceRepository,
+    StagingManifestCommandRepository, StagingManifestRepository,
 };
 use crate::domain::artist::Artist;
 use crate::domain::candidate_match::{
@@ -1733,6 +1733,56 @@ impl ExportRepository for SqliteRepositories {
     }
 }
 
+impl ExportCommandRepository for SqliteRepositories {
+    fn create_exported_metadata_snapshot(
+        &self,
+        snapshot: &ExportedMetadataSnapshot,
+    ) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO exported_metadata_snapshots
+                     (id, release_instance_id, export_profile, album_title, album_artist,
+                      artist_credits_json, edition_visibility, technical_visibility,
+                      path_components_json, primary_artwork_filename, compatibility_verified,
+                      compatibility_warnings_json, rendered_at_unix_seconds)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        snapshot.id.as_uuid().to_string(),
+                        snapshot.release_instance_id.as_uuid().to_string(),
+                        &snapshot.export_profile,
+                        &snapshot.album_title,
+                        &snapshot.album_artist,
+                        serde_json::to_string(&snapshot.artist_credits).map_err(|error| {
+                            storage_error(format!(
+                                "failed to encode exported artist credits: {error}"
+                            ))
+                        })?,
+                        qualifier_visibility_to_sql(&snapshot.edition_visibility),
+                        qualifier_visibility_to_sql(&snapshot.technical_visibility),
+                        serde_json::to_string(&snapshot.path_components).map_err(|error| {
+                            storage_error(format!(
+                                "failed to encode exported path components: {error}"
+                            ))
+                        })?,
+                        &snapshot.primary_artwork_filename,
+                        snapshot.compatibility.verified,
+                        serde_json::to_string(&snapshot.compatibility.warnings).map_err(
+                            |error| {
+                                storage_error(format!(
+                                    "failed to encode exported compatibility warnings: {error}"
+                                ))
+                            },
+                        )?,
+                        snapshot.rendered_at_unix_seconds,
+                    ],
+                )
+                .map_err(to_storage_error)?;
+            Ok(())
+        })
+    }
+}
+
 fn configure_connection(connection: &Connection) -> Result<(), RepositoryError> {
     connection
         .busy_timeout(Duration::from_secs(5))
@@ -3206,6 +3256,14 @@ fn parse_qualifier_visibility(value: String) -> QualifierVisibility {
     }
 }
 
+fn qualifier_visibility_to_sql(value: &QualifierVisibility) -> &'static str {
+    match value {
+        QualifierVisibility::Hidden => "hidden",
+        QualifierVisibility::PathOnly => "path_only",
+        QualifierVisibility::TagsAndPath => "tags_and_path",
+    }
+}
+
 fn parse_release_id(value: Option<String>) -> Result<ReleaseId, String> {
     ReleaseId::parse_str(&value.ok_or_else(|| "missing release subject id".to_string())?)
         .map_err(|error| error.to_string())
@@ -3634,6 +3692,45 @@ mod tests {
             .expect("query should succeed");
         assert_eq!(listed.total, 1);
         assert_eq!(listed.items[0].value, SeedIds::RELEASE);
+    }
+
+    #[test]
+    fn repositories_persist_exported_metadata_snapshots() {
+        let (context, _path) = seeded_context();
+        let repositories = SqliteRepositories::new(context);
+        let snapshot = ExportedMetadataSnapshot {
+            id: ExportedMetadataSnapshotId::new(),
+            release_instance_id: parse_uuid(SeedIds::RELEASE_INSTANCE),
+            export_profile: "generic_player".to_string(),
+            album_title: "In Rainbows [2007 CD]".to_string(),
+            album_artist: "Radiohead".to_string(),
+            artist_credits: vec!["Radiohead".to_string()],
+            edition_visibility: QualifierVisibility::TagsAndPath,
+            technical_visibility: QualifierVisibility::PathOnly,
+            path_components: vec![
+                "Radiohead".to_string(),
+                "In Rainbows [2007 CD] [FLAC lossless]".to_string(),
+            ],
+            primary_artwork_filename: Some("cover.jpg".to_string()),
+            compatibility: CompatibilityReport {
+                verified: true,
+                warnings: vec!["none".to_string()],
+            },
+            rendered_at_unix_seconds: 501,
+        };
+        repositories
+            .create_exported_metadata_snapshot(&snapshot)
+            .expect("snapshot should persist");
+
+        let stored = repositories
+            .get_exported_metadata(&snapshot.id)
+            .expect("lookup should succeed")
+            .expect("snapshot should exist");
+        assert_eq!(stored.album_title, "In Rainbows [2007 CD]");
+        assert_eq!(
+            stored.primary_artwork_filename,
+            Some("cover.jpg".to_string())
+        );
     }
 
     #[test]

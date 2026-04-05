@@ -266,6 +266,13 @@ pub trait ExportRepository {
     ) -> Result<Option<ExportedMetadataSnapshot>, RepositoryError>;
 }
 
+pub trait ExportCommandRepository {
+    fn create_exported_metadata_snapshot(
+        &self,
+        snapshot: &ExportedMetadataSnapshot,
+    ) -> Result<(), RepositoryError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReleaseGroupSearchQuery {
     pub text: Option<String>,
