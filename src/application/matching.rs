@@ -205,6 +205,15 @@ pub struct MaterializedReleaseMatch {
     pub artist: Artist,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectedCandidateMatchReport {
+    pub release_instance: ReleaseInstance,
+    pub release: Release,
+    pub release_group: ReleaseGroup,
+    pub artist: Artist,
+    pub candidate: CandidateMatch,
+}
+
 pub trait MusicBrainzMetadataProvider {
     fn search_releases(
         &self,
@@ -522,6 +531,71 @@ where
             created_at_unix_seconds,
         )?;
         Ok(release_instance)
+    }
+
+    pub async fn select_candidate_match(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        candidate_id: &CandidateMatchId,
+        created_by: &str,
+        note: Option<String>,
+        created_at_unix_seconds: i64,
+    ) -> Result<SelectedCandidateMatchReport, MatchingServiceError> {
+        let candidate = self
+            .repository
+            .get_candidate_match(candidate_id)
+            .map_err(map_repository_error)?
+            .ok_or_else(|| MatchingServiceError {
+                kind: MatchingServiceErrorKind::NotFound,
+                message: format!("no candidate match found for {}", candidate_id.as_uuid()),
+            })?;
+        if candidate.release_instance_id != *release_instance_id {
+            return Err(MatchingServiceError {
+                kind: MatchingServiceErrorKind::Conflict,
+                message: format!(
+                    "candidate {} does not belong to release instance {}",
+                    candidate_id.as_uuid(),
+                    release_instance_id.as_uuid()
+                ),
+            });
+        }
+
+        let provider_release_id = match (&candidate.provider, &candidate.subject) {
+            (CandidateProvider::MusicBrainz, CandidateSubject::Release { provider_id }) => {
+                provider_id.clone()
+            }
+            _ => {
+                return Err(MatchingServiceError {
+                    kind: MatchingServiceErrorKind::Conflict,
+                    message: "only MusicBrainz release candidates can be selected directly"
+                        .to_string(),
+                });
+            }
+        };
+
+        let detail = self
+            .provider
+            .lookup_release(&provider_release_id)
+            .await
+            .map_err(map_provider_error)?;
+        let artist = ensure_artist(&self.repository, &detail)?;
+        let release_group = ensure_release_group(&self.repository, &artist, &detail)?;
+        let release = ensure_release(&self.repository, &artist, &release_group, &detail)?;
+        let release_instance = self.apply_manual_release_override(
+            release_instance_id,
+            &release.id,
+            created_by,
+            note,
+            created_at_unix_seconds,
+        )?;
+
+        Ok(SelectedCandidateMatchReport {
+            release_instance,
+            release,
+            release_group,
+            artist,
+            candidate,
+        })
     }
 
     pub async fn enrich_release_instance_with_discogs(

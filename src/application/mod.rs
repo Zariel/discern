@@ -5,6 +5,7 @@ pub mod export;
 pub mod ingest;
 pub mod issues;
 pub mod jobs;
+pub mod manual_metadata;
 pub mod matching;
 pub mod organize;
 pub mod pipeline;

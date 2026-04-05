@@ -4,6 +4,7 @@ pub mod ingest;
 pub mod inspection;
 pub mod jobs;
 pub mod pagination;
+pub mod review;
 pub mod routes;
 
 use crate::config::ApiConfig;
@@ -14,6 +15,7 @@ pub use ingest::IngestApi;
 pub use inspection::InspectionApi;
 pub use jobs::JobsApi;
 pub use pagination::ApiPaginationMeta;
+pub use review::ReviewApi;
 pub use routes::{ApiRoute, HttpMethod};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
