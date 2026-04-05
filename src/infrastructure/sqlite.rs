@@ -8,9 +8,9 @@ use serde_json::Value;
 
 use crate::application::repository::{
     ExportRepository, ExportedMetadataListQuery, ImportBatchListQuery, ImportBatchRepository,
-    IssueListQuery, IssueRepository, JobListQuery, JobRepository, ReleaseGroupSearchQuery,
-    ReleaseInstanceListQuery, ReleaseInstanceRepository, ReleaseListQuery, ReleaseRepository,
-    RepositoryError, RepositoryErrorKind,
+    IssueCommandRepository, IssueListQuery, IssueRepository, JobListQuery, JobRepository,
+    ReleaseGroupSearchQuery, ReleaseInstanceListQuery, ReleaseInstanceRepository, ReleaseListQuery,
+    ReleaseRepository, RepositoryError, RepositoryErrorKind,
 };
 use crate::domain::candidate_match::{
     CandidateMatch, CandidateProvider, CandidateScore, CandidateSubject, EvidenceKind,
@@ -493,7 +493,8 @@ impl IssueRepository for SqliteRepositories {
         connection
             .query_row(
                 "SELECT id, issue_type, state, subject_kind, subject_id, summary,
-                        details, created_at_unix_seconds
+                        details, created_at_unix_seconds, resolved_at_unix_seconds,
+                        suppressed_reason
                  FROM issues
                  WHERE id = ?1",
                 params![id.as_uuid().to_string()],
@@ -520,7 +521,8 @@ impl IssueRepository for SqliteRepositories {
         let mut statement = connection
             .prepare(
                 "SELECT id, issue_type, state, subject_kind, subject_id, summary,
-                        details, created_at_unix_seconds
+                        details, created_at_unix_seconds, resolved_at_unix_seconds,
+                        suppressed_reason
                  FROM issues
                  WHERE (?1 IS NULL OR state = ?1)
                    AND (?2 IS NULL OR issue_type = ?2)
@@ -546,6 +548,76 @@ impl IssueRepository for SqliteRepositories {
             items,
             request: query.page,
             total: total as u64,
+        })
+    }
+}
+
+impl IssueCommandRepository for SqliteRepositories {
+    fn create_issue(&self, issue: &Issue) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO issues
+                     (id, issue_type, state, subject_kind, subject_id, summary,
+                      details, created_at_unix_seconds, resolved_at_unix_seconds,
+                      suppressed_reason)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        issue.id.as_uuid().to_string(),
+                        issue_type_to_sql(&issue.issue_type),
+                        issue_state_to_sql(&issue.state),
+                        issue_subject_kind_to_sql(&issue.subject),
+                        issue_subject_id_to_sql(&issue.subject),
+                        &issue.summary,
+                        &issue.details,
+                        issue.created_at_unix_seconds,
+                        issue.resolved_at_unix_seconds,
+                        &issue.suppressed_reason,
+                    ],
+                )
+                .map_err(to_storage_error)?;
+            Ok(())
+        })
+    }
+
+    fn update_issue(&self, issue: &Issue) -> Result<(), RepositoryError> {
+        self.context.with_write_transaction(|transaction| {
+            let changed = transaction
+                .execute(
+                    "UPDATE issues
+                     SET issue_type = ?2,
+                         state = ?3,
+                         subject_kind = ?4,
+                         subject_id = ?5,
+                         summary = ?6,
+                         details = ?7,
+                         created_at_unix_seconds = ?8,
+                         resolved_at_unix_seconds = ?9,
+                         suppressed_reason = ?10
+                     WHERE id = ?1",
+                    params![
+                        issue.id.as_uuid().to_string(),
+                        issue_type_to_sql(&issue.issue_type),
+                        issue_state_to_sql(&issue.state),
+                        issue_subject_kind_to_sql(&issue.subject),
+                        issue_subject_id_to_sql(&issue.subject),
+                        &issue.summary,
+                        &issue.details,
+                        issue.created_at_unix_seconds,
+                        issue.resolved_at_unix_seconds,
+                        &issue.suppressed_reason,
+                    ],
+                )
+                .map_err(to_storage_error)?;
+
+            if changed == 0 {
+                return Err(RepositoryError {
+                    kind: RepositoryErrorKind::NotFound,
+                    message: format!("issue {} was not found", issue.id.as_uuid()),
+                });
+            }
+
+            Ok(())
         })
     }
 }
@@ -842,6 +914,8 @@ fn map_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
         summary: row.get(5)?,
         details: row.get(6)?,
         created_at_unix_seconds: row.get(7)?,
+        resolved_at_unix_seconds: row.get(8)?,
+        suppressed_reason: row.get(9)?,
     })
 }
 
@@ -1229,6 +1303,24 @@ fn parse_issue_subject(kind: String, id: Option<String>) -> Result<IssueSubject,
         "track_instance" => Ok(IssueSubject::TrackInstance(parse_track_instance_id(id)?)),
         "library" => Ok(IssueSubject::Library),
         other => Err(format!("unknown issue subject kind '{other}'")),
+    }
+}
+
+fn issue_subject_kind_to_sql(subject: &IssueSubject) -> &'static str {
+    match subject {
+        IssueSubject::Release(_) => "release",
+        IssueSubject::ReleaseInstance(_) => "release_instance",
+        IssueSubject::TrackInstance(_) => "track_instance",
+        IssueSubject::Library => "library",
+    }
+}
+
+fn issue_subject_id_to_sql(subject: &IssueSubject) -> Option<String> {
+    match subject {
+        IssueSubject::Release(id) => Some(id.as_uuid().to_string()),
+        IssueSubject::ReleaseInstance(id) => Some(id.as_uuid().to_string()),
+        IssueSubject::TrackInstance(id) => Some(id.as_uuid().to_string()),
+        IssueSubject::Library => None,
     }
 }
 

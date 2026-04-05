@@ -151,6 +151,8 @@ fn supporting_entities_reference_domain_subjects_not_row_shapes() {
         summary: "Multiple MusicBrainz candidates remain".to_string(),
         details: None,
         created_at_unix_seconds: 1_712_288_200,
+        resolved_at_unix_seconds: None,
+        suppressed_reason: None,
     };
 
     let job = Job {
@@ -175,6 +177,40 @@ fn supporting_entities_reference_domain_subjects_not_row_shapes() {
     assert_eq!(
         job.subject,
         JobSubject::ReleaseInstance(release_instance_id)
+    );
+}
+
+#[test]
+fn issues_track_resolution_and_suppression_lifecycle() {
+    let subject = IssueSubject::Library;
+    let mut resolved_issue = Issue::open(
+        IssueType::MissingArtwork,
+        subject.clone(),
+        "Artwork missing",
+        None,
+        1_712_288_400,
+    );
+    resolved_issue
+        .resolve(1_712_288_500)
+        .expect("open issues should resolve");
+    assert_eq!(resolved_issue.state, IssueState::Resolved);
+    assert_eq!(resolved_issue.resolved_at_unix_seconds, Some(1_712_288_500));
+    assert_eq!(resolved_issue.suppressed_reason, None);
+
+    let mut suppressed_issue = Issue::open(
+        IssueType::DuplicateReleaseInstance,
+        subject,
+        "Known duplicate",
+        Some("Operator accepted overlap".to_string()),
+        1_712_288_401,
+    );
+    suppressed_issue
+        .suppress("intentional duplicate", 1_712_288_501)
+        .expect("open issues should suppress");
+    assert_eq!(suppressed_issue.state, IssueState::Suppressed);
+    assert_eq!(
+        suppressed_issue.suppressed_reason,
+        Some("intentional duplicate".to_string())
     );
 }
 

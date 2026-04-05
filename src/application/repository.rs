@@ -85,6 +85,12 @@ pub trait IssueRepository {
     fn list_issues(&self, query: &IssueListQuery) -> Result<Page<Issue>, RepositoryError>;
 }
 
+pub trait IssueCommandRepository {
+    fn create_issue(&self, issue: &Issue) -> Result<(), RepositoryError>;
+
+    fn update_issue(&self, issue: &Issue) -> Result<(), RepositoryError>;
+}
+
 pub trait JobRepository {
     fn get_job(&self, id: &JobId) -> Result<Option<Job>, RepositoryError>;
 
