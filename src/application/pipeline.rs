@@ -2,6 +2,7 @@ use crate::application::compatibility::{
     CompatibilityVerificationError, CompatibilityVerificationService,
 };
 use crate::application::config::ValidatedRuntimeConfig;
+use crate::application::duplicates::{DuplicateHandlingError, DuplicateHandlingService};
 use crate::application::export::{ExportRenderingError, ExportRenderingService};
 use crate::application::ingest::{WatchDiscoveryError, WatchDiscoveryService};
 use crate::application::issues::IssueServiceError;
@@ -11,6 +12,7 @@ use crate::application::matching::{
     ReleaseMatchingService,
 };
 use crate::application::organize::{FileOrganizationService, OrganizationError};
+use crate::application::recovery::{RecoveryError, RecoveryService};
 use crate::application::repository::{
     ExportCommandRepository, ExportRepository, ImportBatchCommandRepository, ImportBatchRepository,
     IngestEvidenceCommandRepository, IngestEvidenceRepository, IssueCommandRepository,
@@ -135,10 +137,10 @@ where
             JobType::WriteTags => self.run_write_tags_job(&job, changed_at_unix_seconds).await,
             JobType::OrganizeFiles => self.run_organize_job(&job, changed_at_unix_seconds).await,
             JobType::VerifyImport => self.run_verify_job(&job, changed_at_unix_seconds).await,
-            JobType::ReprocessReleaseInstance | JobType::RescanWatcher => Err(StageFailure {
-                kind: StageFailureKind::Conflict,
-                message: format!("job type {} is not wired yet", job_type_name(&job.job_type)),
-            }),
+            JobType::ReprocessReleaseInstance => {
+                self.run_reprocess_job(&job, changed_at_unix_seconds).await
+            }
+            JobType::RescanWatcher => self.run_rescan_job(&job, changed_at_unix_seconds).await,
         };
 
         match result {
@@ -264,6 +266,24 @@ where
             .enrich_release_instance_with_discogs(&release_instance_id, changed_at_unix_seconds)
             .await
             .map_err(map_matching_error)?;
+        let duplicate_report = DuplicateHandlingService::new(self.repository.clone())
+            .evaluate_release_instance(
+                &self.config.import,
+                &release_instance_id,
+                changed_at_unix_seconds,
+            )
+            .map_err(map_duplicate_error)?;
+        if duplicate_report.quarantined {
+            self.update_release_instance_state(
+                &release_instance_id,
+                ReleaseInstanceState::Quarantined,
+            )?;
+            self.update_import_batch_state_for_release_instance(
+                &release_instance_id,
+                crate::domain::import_batch::ImportBatchStatus::Quarantined,
+            )?;
+            return Ok(Vec::new());
+        }
         let queued = self.enqueue_job_once(
             JobType::RenderExportMetadata,
             JobSubject::ReleaseInstance(release_instance_id),
@@ -366,6 +386,41 @@ where
         Ok(Vec::new())
     }
 
+    async fn run_reprocess_job(
+        &self,
+        job: &Job,
+        changed_at_unix_seconds: i64,
+    ) -> Result<Vec<Job>, StageFailure> {
+        let release_instance_id = resolve_release_instance_subject(&job.subject)?;
+        let subject = RecoveryService::new(self.repository.clone(), self.config.clone())
+            .reprocess_release_instance(&release_instance_id)
+            .map_err(map_recovery_error)?;
+        let queued = self.enqueue_job_once(
+            JobType::AnalyzeReleaseInstance,
+            subject,
+            JobTrigger::Operator,
+            changed_at_unix_seconds,
+        )?;
+        Ok(queued.into_iter().collect())
+    }
+
+    async fn run_rescan_job(
+        &self,
+        job: &Job,
+        changed_at_unix_seconds: i64,
+    ) -> Result<Vec<Job>, StageFailure> {
+        let JobSubject::SourceScan(scan_subject) = &job.subject else {
+            return Err(StageFailure::conflict(format!(
+                "job type {} requires a source scan subject",
+                job_type_name(&job.job_type)
+            )));
+        };
+        let report = RecoveryService::new(self.repository.clone(), self.config.clone())
+            .rescan_watcher(scan_subject, changed_at_unix_seconds)
+            .map_err(map_recovery_error)?;
+        Ok(report.queued_jobs)
+    }
+
     async fn handle_failure(
         &self,
         job: &Job,
@@ -452,6 +507,37 @@ where
             .map_err(map_repository_error)
     }
 
+    fn update_import_batch_state_for_release_instance(
+        &self,
+        release_instance_id: &ReleaseInstanceId,
+        status: crate::domain::import_batch::ImportBatchStatus,
+    ) -> Result<(), StageFailure> {
+        let release_instance = self
+            .repository
+            .get_release_instance(release_instance_id)
+            .map_err(map_repository_error)?
+            .ok_or_else(|| {
+                StageFailure::not_found(format!(
+                    "no release instance found for {}",
+                    release_instance_id.as_uuid()
+                ))
+            })?;
+        let mut batch = self
+            .repository
+            .get_import_batch(&release_instance.import_batch_id)
+            .map_err(map_repository_error)?
+            .ok_or_else(|| {
+                StageFailure::not_found(format!(
+                    "no import batch found for {}",
+                    release_instance.import_batch_id.as_uuid()
+                ))
+            })?;
+        batch.status = status;
+        self.repository
+            .update_import_batch(&batch)
+            .map_err(map_repository_error)
+    }
+
     fn enqueue_job_once(
         &self,
         job_type: JobType,
@@ -508,6 +594,13 @@ impl StageFailure {
     fn not_found(message: String) -> Self {
         Self {
             kind: StageFailureKind::NotFound,
+            message,
+        }
+    }
+
+    fn conflict(message: String) -> Self {
+        Self {
+            kind: StageFailureKind::Conflict,
             message,
         }
     }
@@ -729,6 +822,23 @@ fn map_matching_error(error: MatchingServiceError) -> StageFailure {
     }
 }
 
+fn map_duplicate_error(error: DuplicateHandlingError) -> StageFailure {
+    StageFailure {
+        kind: match error.kind {
+            crate::application::duplicates::DuplicateHandlingErrorKind::NotFound => {
+                StageFailureKind::NotFound
+            }
+            crate::application::duplicates::DuplicateHandlingErrorKind::Conflict => {
+                StageFailureKind::Conflict
+            }
+            crate::application::duplicates::DuplicateHandlingErrorKind::Storage => {
+                StageFailureKind::Storage
+            }
+        },
+        message: error.message,
+    }
+}
+
 fn map_export_error(error: ExportRenderingError) -> StageFailure {
     StageFailure {
         kind: match error.kind {
@@ -788,6 +898,17 @@ fn map_compatibility_error(error: CompatibilityVerificationError) -> StageFailur
             crate::application::compatibility::CompatibilityVerificationErrorKind::Storage => {
                 StageFailureKind::Storage
             }
+        },
+        message: error.message,
+    }
+}
+
+fn map_recovery_error(error: RecoveryError) -> StageFailure {
+    StageFailure {
+        kind: match error.kind {
+            crate::application::recovery::RecoveryErrorKind::NotFound => StageFailureKind::NotFound,
+            crate::application::recovery::RecoveryErrorKind::Conflict => StageFailureKind::Conflict,
+            crate::application::recovery::RecoveryErrorKind::Storage => StageFailureKind::Storage,
         },
         message: error.message,
     }
@@ -1093,6 +1214,160 @@ mod tests {
                 .any(|issue| issue.issue_type == IssueType::BrokenTags)
         );
         assert_eq!(repository.job(&write_job.id).status, JobStatus::Failed);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enrich_job_quarantines_duplicates_when_configured() {
+        let root = test_root("pipeline-duplicate-quarantine");
+        let source_dir = root.join("incoming/Kid A");
+        fs::create_dir_all(&source_dir).expect("source dir should exist");
+        let mp3_path = source_dir.join("01 - Everything in Its Right Place.mp3");
+        seed_mp3(
+            &mp3_path,
+            "Radiohead",
+            "Kid A",
+            "Everything in Its Right Place",
+        );
+
+        let repository = InMemoryPipelineRepository::for_release_instance_pipeline(
+            &source_dir,
+            mp3_path.clone(),
+        );
+        repository.seed_duplicate_release_instance();
+        let mut config = AppConfig::default();
+        config.import.duplicate_policy = crate::config::DuplicatePolicy::Quarantine;
+        let service = JobPipelineService::new(
+            repository.clone(),
+            FakePipelineProvider::default(),
+            ValidatedRuntimeConfig::from_validated_app_config(&config),
+            WorkerPools::from_config(&config.workers),
+        );
+        let enrich_job = repository.insert_job(Job::queued(
+            JobType::EnrichReleaseInstance,
+            JobSubject::ReleaseInstance(repository.release_instance_id()),
+            JobTrigger::System,
+            10,
+        ));
+
+        let report = service
+            .run_job(&enrich_job.id, 20)
+            .await
+            .expect("enrich job should succeed");
+
+        assert_eq!(report.queued_jobs.len(), 0);
+        assert_eq!(
+            repository.release_instance().state,
+            ReleaseInstanceState::Quarantined
+        );
+        assert_eq!(repository.batch_status(), ImportBatchStatus::Quarantined);
+        assert!(
+            repository
+                .open_issues()
+                .iter()
+                .any(|issue| { issue.issue_type == IssueType::DuplicateReleaseInstance })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reprocess_job_queues_batch_analysis() {
+        let root = test_root("pipeline-reprocess");
+        let source_dir = root.join("incoming/Kid A");
+        fs::create_dir_all(&source_dir).expect("source dir should exist");
+        let mp3_path = source_dir.join("01 - Everything in Its Right Place.mp3");
+        seed_mp3(
+            &mp3_path,
+            "Radiohead",
+            "Kid A",
+            "Everything in Its Right Place",
+        );
+
+        let repository = InMemoryPipelineRepository::for_release_instance_pipeline(
+            &source_dir,
+            mp3_path.clone(),
+        );
+        let config = AppConfig::default();
+        let service = JobPipelineService::new(
+            repository.clone(),
+            FakePipelineProvider::default(),
+            ValidatedRuntimeConfig::from_validated_app_config(&config),
+            WorkerPools::from_config(&config.workers),
+        );
+        let reprocess_job = repository.insert_job(Job::queued(
+            JobType::ReprocessReleaseInstance,
+            JobSubject::ReleaseInstance(repository.release_instance_id()),
+            JobTrigger::Operator,
+            10,
+        ));
+
+        let report = service
+            .run_job(&reprocess_job.id, 20)
+            .await
+            .expect("reprocess job should succeed");
+
+        assert_eq!(report.queued_jobs.len(), 1);
+        assert_eq!(
+            report.queued_jobs[0].job_type,
+            JobType::AnalyzeReleaseInstance
+        );
+        assert_eq!(
+            report.queued_jobs[0].subject,
+            JobSubject::ImportBatch(repository.batch_id())
+        );
+        assert_eq!(
+            repository.release_instance().state,
+            ReleaseInstanceState::Staged
+        );
+        assert_eq!(repository.batch_status(), ImportBatchStatus::Created);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rescan_job_discovers_watch_batches_for_named_watcher() {
+        let root = test_root("pipeline-rescan");
+        let watch_dir = root.join("incoming/watch");
+        let album_dir = watch_dir.join("Kid A");
+        fs::create_dir_all(&album_dir).expect("album dir should exist");
+        let mp3_path = album_dir.join("01 - Everything in Its Right Place.mp3");
+        seed_mp3(
+            &mp3_path,
+            "Radiohead",
+            "Kid A",
+            "Everything in Its Right Place",
+        );
+
+        let repository = InMemoryPipelineRepository::for_batch_pipeline(&watch_dir, Vec::new());
+        let mut config = AppConfig::default();
+        config.storage.watch_directories = vec![crate::config::WatchDirectoryConfig {
+            name: "watch".to_string(),
+            path: watch_dir.clone(),
+            scan_mode: crate::config::WatchScanMode::EventDriven,
+            import_mode_override: None,
+        }];
+        let service = JobPipelineService::new(
+            repository.clone(),
+            FakePipelineProvider::default(),
+            ValidatedRuntimeConfig::from_validated_app_config(&config),
+            WorkerPools::from_config(&config.workers),
+        );
+        let rescan_job = repository.insert_job(Job::queued(
+            JobType::RescanWatcher,
+            JobSubject::SourceScan("watch".to_string()),
+            JobTrigger::Operator,
+            10,
+        ));
+
+        let report = service
+            .run_job(&rescan_job.id, 20)
+            .await
+            .expect("rescan job should succeed");
+
+        assert_eq!(report.queued_jobs.len(), 1);
+        assert_eq!(report.queued_jobs[0].job_type, JobType::DiscoverBatch);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1444,6 +1719,34 @@ mod tests {
                         warnings: Vec::new(),
                     },
                     rendered_at_unix_seconds: 1,
+                });
+        }
+
+        fn seed_duplicate_release_instance(&self) {
+            self.release_instances
+                .lock()
+                .expect("release instances should lock")
+                .push(ReleaseInstance {
+                    id: ReleaseInstanceId::new(),
+                    import_batch_id: ImportBatchId::new(),
+                    source_id: SourceId::new(),
+                    release_id: Some(self.release_id.clone()),
+                    state: ReleaseInstanceState::Verified,
+                    technical_variant: TechnicalVariant {
+                        format_family: FormatFamily::Mp3,
+                        bitrate_mode: BitrateMode::Variable,
+                        bitrate_kbps: Some(320),
+                        sample_rate_hz: Some(44_100),
+                        bit_depth: None,
+                        track_count: 1,
+                        total_duration_seconds: 254,
+                    },
+                    provenance: ProvenanceSnapshot {
+                        ingest_origin: IngestOrigin::ManualAdd,
+                        original_source_path: "/tmp/duplicate".to_string(),
+                        imported_at_unix_seconds: 1,
+                        gazelle_reference: None,
+                    },
                 });
         }
 

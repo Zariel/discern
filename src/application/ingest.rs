@@ -159,9 +159,43 @@ where
         &self,
         discovered_at_unix_seconds: i64,
     ) -> Result<WatchDiscoveryReport, WatchDiscoveryError> {
+        self.discover_watch_batches_for_watchers(
+            &self.config.storage.watch_directories,
+            discovered_at_unix_seconds,
+        )
+    }
+
+    pub fn discover_watch_batches_for_scan(
+        &self,
+        scan_subject: &str,
+        discovered_at_unix_seconds: i64,
+    ) -> Result<WatchDiscoveryReport, WatchDiscoveryError> {
+        let watcher = self
+            .config
+            .storage
+            .watch_directories
+            .iter()
+            .find(|watcher| {
+                watcher.name == scan_subject || watcher.path.display().to_string() == scan_subject
+            })
+            .ok_or_else(|| WatchDiscoveryError {
+                kind: WatchDiscoveryErrorKind::NotFound,
+                message: format!("watch directory {scan_subject} is not configured"),
+            })?;
+        self.discover_watch_batches_for_watchers(
+            std::slice::from_ref(watcher),
+            discovered_at_unix_seconds,
+        )
+    }
+
+    fn discover_watch_batches_for_watchers(
+        &self,
+        watchers: &[WatchDirectoryPolicy],
+        discovered_at_unix_seconds: i64,
+    ) -> Result<WatchDiscoveryReport, WatchDiscoveryError> {
         let mut report = WatchDiscoveryReport::default();
 
-        for watcher in &self.config.storage.watch_directories {
+        for watcher in watchers {
             let source = self.find_or_create_watch_source(watcher)?;
             let active_paths = self
                 .repository
