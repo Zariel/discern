@@ -23,7 +23,7 @@ pub enum HttpMethod {
 }
 
 pub fn core_routes(base_path: &str) -> Vec<ApiRoute> {
-    [
+    let mut routes: Vec<_> = [
         (HttpMethod::Get, "/releases", false),
         (HttpMethod::Get, "/releases/{id}", false),
         (HttpMethod::Patch, "/releases/{id}", false),
@@ -76,5 +76,11 @@ pub fn core_routes(base_path: &str) -> Vec<ApiRoute> {
     .map(|(method, suffix, long_running)| {
         ApiRoute::new(method, format!("{base_path}{suffix}"), long_running)
     })
-    .collect()
+    .collect();
+    routes.extend([
+        ApiRoute::new(HttpMethod::Get, "/health/live".to_string(), false),
+        ApiRoute::new(HttpMethod::Get, "/health/ready".to_string(), false),
+        ApiRoute::new(HttpMethod::Get, "/metrics".to_string(), false),
+    ]);
+    routes
 }

@@ -155,5 +155,23 @@ mod tests {
             route.method == HttpMethod::Get
                 && route.path == "/api/release-instances/{id}/export-preview"
         }));
+        assert!(
+            surface
+                .routes
+                .iter()
+                .any(|route| route.method == HttpMethod::Get && route.path == "/health/live")
+        );
+        assert!(
+            surface
+                .routes
+                .iter()
+                .any(|route| route.method == HttpMethod::Get && route.path == "/health/ready")
+        );
+        assert!(
+            surface
+                .routes
+                .iter()
+                .any(|route| route.method == HttpMethod::Get && route.path == "/metrics")
+        );
     }
 }
