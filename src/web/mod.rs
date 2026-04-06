@@ -1,4 +1,5 @@
 pub mod client;
+pub mod dashboard;
 pub mod export_preview;
 pub mod import;
 pub mod inspect;
@@ -11,6 +12,7 @@ use std::path::PathBuf;
 use crate::config::{ApiConfig, WebConfig};
 
 pub use client::{WebApiClient, WebApiPaths};
+pub use dashboard::{DashboardQuery, OperationsDashboard, OperationsDashboardLoader};
 pub use export_preview::{ExportPreviewScreen, ExportPreviewScreenLoader};
 pub use import::{ManualImportBatchesFilters, ManualImportScreen, ManualImportScreenLoader};
 pub use inspect::{
