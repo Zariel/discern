@@ -1,0 +1,6 @@
+verified=false
+issues=player_visibility_collision
+current_title=Kid A [2000 CD]
+sibling_title=Kid A [2000 CD]
+warning_count=2
+has_visibility_collision=false

@@ -1,0 +1,5 @@
+verified=true
+issues=none
+first_path=Radiohead/Kid A [2000 CD]
+second_path=Radiohead/Kid A [2000 CD]
+warnings=initial renderer warning

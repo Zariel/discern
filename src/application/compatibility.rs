@@ -694,6 +694,67 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_path_fixture_remains_stable_across_verification_runs() {
+        let root = test_root("compatibility-managed-path-stability");
+        let repository = InMemoryCompatibilityRepository::new(&root);
+        repository.write_managed_audio();
+        repository.write_managed_artwork();
+        let service = CompatibilityVerificationService::new(repository.clone());
+
+        let first_report = service
+            .verify_release_instance(&repository.current_release_instance.id, 200)
+            .await
+            .expect("first verification should succeed");
+        let first_path = repository.current_snapshot().path_components.join("/");
+        let second_report = service
+            .verify_release_instance(&repository.current_release_instance.id, 201)
+            .await
+            .expect("second verification should succeed");
+        let second_path = repository.current_snapshot().path_components.join("/");
+
+        assert_eq!(
+            render_regression_fixture(
+                first_report.verified,
+                &first_report.issue_types,
+                &first_path,
+                &second_path,
+                &second_report.warnings,
+            ),
+            include_str!("../../tests/golden/compatibility_managed_path_stability.txt")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn visibility_collision_fixture_matches_expected_summary() {
+        let root = test_root("compatibility-visibility-fixture");
+        let repository = InMemoryCompatibilityRepository::new(&root);
+        repository.write_managed_audio();
+        repository.write_managed_artwork();
+        repository.make_sibling_share_visible_identity();
+        let service = CompatibilityVerificationService::new(repository.clone());
+
+        let report = service
+            .verify_release_instance(&repository.current_release_instance.id, 200)
+            .await
+            .expect("verification should succeed");
+
+        assert_eq!(
+            render_visibility_fixture(
+                report.verified,
+                &report.issue_types,
+                &repository.current_snapshot().album_title,
+                &repository.sibling_snapshot().album_title,
+                &report.warnings,
+            ),
+            include_str!("../../tests/golden/compatibility_visibility_collision.txt")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[derive(Clone)]
     struct InMemoryCompatibilityRepository {
         release_group: ReleaseGroup,
@@ -867,6 +928,16 @@ mod tests {
                 .find(|snapshot| snapshot.release_instance_id == self.current_release_instance.id)
                 .cloned()
                 .expect("current snapshot should exist")
+        }
+
+        fn sibling_snapshot(&self) -> ExportedMetadataSnapshot {
+            self.exports
+                .lock()
+                .expect("exports should lock")
+                .iter()
+                .find(|snapshot| snapshot.release_instance_id == self.sibling_release_instance.id)
+                .cloned()
+                .expect("sibling snapshot should exist")
         }
 
         fn open_issue_types(&self) -> Vec<IssueType> {
@@ -1257,5 +1328,64 @@ mod tests {
         let root = std::env::temp_dir().join(format!("discern-{label}-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).expect("temp root should exist");
         root
+    }
+
+    fn render_regression_fixture(
+        verified: bool,
+        issue_types: &[IssueType],
+        first_path: &str,
+        second_path: &str,
+        warnings: &[String],
+    ) -> String {
+        format!(
+            "verified={verified}\nissues={}\nfirst_path={first_path}\nsecond_path={second_path}\nwarnings={}\n",
+            render_issue_types(issue_types),
+            warnings.join("|"),
+        )
+    }
+
+    fn render_visibility_fixture(
+        verified: bool,
+        issue_types: &[IssueType],
+        current_title: &str,
+        sibling_title: &str,
+        warnings: &[String],
+    ) -> String {
+        format!(
+            "verified={verified}\nissues={}\ncurrent_title={current_title}\nsibling_title={sibling_title}\nwarning_count={}\nhas_visibility_collision={}\n",
+            render_issue_types(issue_types),
+            warnings.len(),
+            warnings
+                .iter()
+                .any(|warning| warning.contains("player-visible metadata")),
+        )
+    }
+
+    fn render_issue_types(issue_types: &[IssueType]) -> String {
+        if issue_types.is_empty() {
+            return "none".to_string();
+        }
+
+        issue_types
+            .iter()
+            .map(|issue_type| match issue_type {
+                IssueType::UndistinguishableReleaseInstance => "undistinguishable_release_instance",
+                IssueType::PlayerVisibilityCollision => "player_visibility_collision",
+                IssueType::PlayerCompatibilityFailure => "player_compatibility_failure",
+                IssueType::AmbiguousReleaseMatch => "ambiguous_release_match",
+                IssueType::UnmatchedRelease => "unmatched_release",
+                IssueType::ConflictingMetadata => "conflicting_metadata",
+                IssueType::InconsistentTrackCount => "inconsistent_track_count",
+                IssueType::MissingTracks => "missing_tracks",
+                IssueType::CorruptFile => "corrupt_file",
+                IssueType::UnsupportedFormat => "unsupported_format",
+                IssueType::DuplicateReleaseInstance => "duplicate_release_instance",
+                IssueType::MissingArtwork => "missing_artwork",
+                IssueType::BrokenTags => "broken_tags",
+                IssueType::MultiDiscAmbiguity => "multi_disc_ambiguity",
+                IssueType::CompilationArtistAmbiguity => "compilation_artist_ambiguity",
+            })
+            .collect::<Vec<_>>()
+            .join("|")
     }
 }
