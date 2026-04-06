@@ -63,8 +63,20 @@ impl WebApiPaths {
         format!("{}/{}", self.issues, issue_id)
     }
 
+    pub fn resolve_issue(&self, issue_id: &str) -> String {
+        format!("{}/{}/resolve", self.issues, issue_id)
+    }
+
+    pub fn suppress_issue(&self, issue_id: &str) -> String {
+        format!("{}/{}/suppress", self.issues, issue_id)
+    }
+
     pub fn job(&self, job_id: &str) -> String {
         format!("{}/{}", self.jobs, job_id)
+    }
+
+    pub fn retry_job(&self, job_id: &str) -> String {
+        format!("{}/{}/retry", self.jobs, job_id)
     }
 }
 
@@ -86,5 +98,10 @@ mod tests {
             client.paths.candidate_matches("relinst_123"),
             "/api/release-instances/relinst_123/candidate-matches"
         );
+        assert_eq!(
+            client.paths.resolve_issue("issue_123"),
+            "/api/issues/issue_123/resolve"
+        );
+        assert_eq!(client.paths.retry_job("job_123"), "/api/jobs/job_123/retry");
     }
 }

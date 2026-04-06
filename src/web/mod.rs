@@ -1,4 +1,5 @@
 pub mod client;
+pub mod operate;
 pub mod shell;
 
 use std::path::PathBuf;
@@ -6,6 +7,10 @@ use std::path::PathBuf;
 use crate::config::{ApiConfig, WebConfig};
 
 pub use client::{WebApiClient, WebApiPaths};
+pub use operate::{
+    IssueQueueActionRequest, IssueQueueFilters, IssueQueueScreen, IssueQueueScreenLoader,
+    IssueQueueSummary, JobsScreen, JobsScreenFilters, JobsScreenLoader, JobsScreenSummary,
+};
 pub use shell::{ShellNavGroup, ShellNavItem, ShellRoute, WebShell};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
