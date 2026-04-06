@@ -13,6 +13,7 @@ use crate::application::matching::{
     MusicBrainzReleaseDetail as MatchingReleaseDetail, MusicBrainzReleaseGroupCandidate,
     MusicBrainzReleaseGroupRef as MatchingReleaseGroupRef,
 };
+use crate::application::observability::{LogLevel, ObservabilityContext, labels};
 use crate::config::MusicBrainzConfig;
 
 const DEFAULT_BASE_URL: &str = "https://musicbrainz.org/ws/2";
@@ -25,6 +26,7 @@ pub struct MusicBrainzClient {
     http: reqwest::Client,
     min_interval: Duration,
     state: Arc<Mutex<ClientState>>,
+    observability: Option<ObservabilityContext>,
 }
 
 #[derive(Debug)]
@@ -130,10 +132,18 @@ pub struct MusicBrainzMedium {
 
 impl MusicBrainzClient {
     pub fn from_config(config: &MusicBrainzConfig) -> Self {
+        Self::from_config_with_observability(config, None)
+    }
+
+    pub fn from_config_with_observability(
+        config: &MusicBrainzConfig,
+        observability: Option<ObservabilityContext>,
+    ) -> Self {
         Self::new(
             DEFAULT_BASE_URL,
             config.contact_email.clone(),
             config.rate_limit_per_second,
+            observability,
         )
         .expect("musicbrainz client should construct")
     }
@@ -142,6 +152,7 @@ impl MusicBrainzClient {
         base_url: impl Into<String>,
         contact_email: Option<String>,
         rate_limit_per_second: u16,
+        observability: Option<ObservabilityContext>,
     ) -> Result<Self, MusicBrainzError> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let mut headers = HeaderMap::new();
@@ -169,6 +180,7 @@ impl MusicBrainzClient {
             http,
             min_interval,
             state: Arc::new(Mutex::new(ClientState::default())),
+            observability,
         })
     }
 
@@ -249,6 +261,7 @@ impl MusicBrainzClient {
         let wait = {
             let mut state = self.state.lock().await;
             if let Some(cached) = state.cache.get(&key) {
+                self.record_provider_result("cache_hit", path);
                 return Ok(cached.clone());
             }
             let now = Instant::now();
@@ -261,6 +274,7 @@ impl MusicBrainzClient {
         };
 
         if !wait.is_zero() {
+            self.record_rate_limit_hit(path);
             sleep(wait).await;
         }
 
@@ -274,24 +288,32 @@ impl MusicBrainzClient {
             .map_err(|error| MusicBrainzError {
                 kind: MusicBrainzErrorKind::Request,
                 message: format!("MusicBrainz request failed: {error}"),
-            })?;
+            })
+            .inspect_err(|_| self.record_provider_result("request_error", path))?;
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            self.record_provider_result("rate_limited", path);
             return Err(MusicBrainzError {
                 kind: MusicBrainzErrorKind::RateLimited,
                 message: "MusicBrainz rate limit exceeded".to_string(),
             });
         }
         if !response.status().is_success() {
+            self.record_provider_result("http_error", path);
             return Err(MusicBrainzError {
                 kind: MusicBrainzErrorKind::Request,
                 message: format!("MusicBrainz returned HTTP {}", response.status()),
             });
         }
 
-        let body = response.text().await.map_err(|error| MusicBrainzError {
-            kind: MusicBrainzErrorKind::Request,
-            message: format!("failed to read MusicBrainz response body: {error}"),
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|error| MusicBrainzError {
+                kind: MusicBrainzErrorKind::Request,
+                message: format!("failed to read MusicBrainz response body: {error}"),
+            })
+            .inspect_err(|_| self.record_provider_result("request_error", path))?;
+        self.record_provider_result("success", path);
 
         let mut state = self.state.lock().await;
         if !state.cache.contains_key(&key) {
@@ -304,6 +326,42 @@ impl MusicBrainzClient {
             }
         }
         Ok(body)
+    }
+
+    fn record_provider_result(&self, result: &str, path: &str) {
+        if let Some(observability) = &self.observability {
+            observability.metrics.increment_counter(
+                "metadata_provider_requests_total",
+                labels([("provider", "musicbrainz"), ("result", result)]),
+            );
+            observability.emit(
+                if matches!(result, "success" | "cache_hit") {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Warn
+                },
+                "provider_request",
+                [
+                    ("provider", "musicbrainz"),
+                    ("result", result),
+                    ("path", path),
+                ],
+            );
+        }
+    }
+
+    fn record_rate_limit_hit(&self, path: &str) {
+        if let Some(observability) = &self.observability {
+            observability.metrics.increment_counter(
+                "metadata_provider_rate_limit_hits_total",
+                labels([("provider", "musicbrainz")]),
+            );
+            observability.emit(
+                LogLevel::Warn,
+                "provider_rate_limit_wait",
+                [("provider", "musicbrainz"), ("path", path)],
+            );
+        }
     }
 }
 
@@ -630,9 +688,13 @@ mod tests {
             200,
             r#"{"releases":[{"id":"release-1","score":"100","title":"Kid A","status":"Official","country":"GB","date":"2000-10-02","barcode":"123","packaging":"Jewel Case","track-count":10,"artist-credit":[{"name":"Radiohead","artist":{"id":"artist-1","name":"Radiohead","sort-name":"Radiohead"}}],"release-group":{"id":"group-1","title":"Kid A","primary-type":"Album"},"label-info":[{"catalog-number":"XLLP782","label":{"id":"label-1","name":"XL Recordings"}}]}]}"#,
         )]);
-        let client =
-            MusicBrainzClient::new(server.base_url(), Some("ops@example.com".to_string()), 20)
-                .expect("client should construct");
+        let client = MusicBrainzClient::new(
+            server.base_url(),
+            Some("ops@example.com".to_string()),
+            20,
+            None,
+        )
+        .expect("client should construct");
 
         let releases = client
             .search_releases("release:kid a AND artist:radiohead", 5)
@@ -664,8 +726,8 @@ mod tests {
             200,
             r#"{"release-groups":[{"id":"group-1","score":"87","title":"Kid A","primary-type":"Album","first-release-date":"2000","artist-credit":[{"name":"Radiohead","artist":{"id":"artist-1","name":"Radiohead","sort-name":"Radiohead"}}]}]}"#,
         )]);
-        let client =
-            MusicBrainzClient::new(server.base_url(), None, 20).expect("client should construct");
+        let client = MusicBrainzClient::new(server.base_url(), None, 20, None)
+            .expect("client should construct");
 
         let first = client
             .search_release_groups("releasegroup:kid a", 3)
@@ -692,8 +754,8 @@ mod tests {
                 r#"{"id":"release-2","title":"Amnesiac","artist-credit":[],"label-info":[],"media":[]}"#,
             ),
         ]);
-        let client =
-            MusicBrainzClient::new(server.base_url(), None, 20).expect("client should construct");
+        let client = MusicBrainzClient::new(server.base_url(), None, 20, None)
+            .expect("client should construct");
 
         let first = client.lookup_release("release-1");
         let second = client.lookup_release("release-2");

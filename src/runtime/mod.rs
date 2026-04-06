@@ -1,6 +1,6 @@
 use crate::api::ApiSurface;
-use crate::application::ApplicationContext;
 use crate::application::jobs::JobService;
+use crate::application::{ApplicationContext, LogLevel};
 use crate::config::{AppConfig, ConfigValidationReport};
 use crate::domain::job::Job;
 use crate::infrastructure::Infrastructure;
@@ -57,18 +57,37 @@ fn bootstrap_at(
         .validate_startup()
         .map_err(RuntimeBootstrapError::InvalidConfig)?;
 
-    let infrastructure = Infrastructure::from_config(
+    let application = ApplicationContext::new(&config);
+    let infrastructure = Infrastructure::from_config_with_observability(
         &config.storage,
         &config.providers.musicbrainz,
         &config.providers.discogs,
+        Some(application.observability.clone()),
     );
     let startup_recovery = recover_startup_jobs(
         &infrastructure.sqlite.database_path,
         recovered_at_unix_seconds,
+        &application,
     )?;
+    application.observability.emit(
+        LogLevel::Info,
+        "runtime_bootstrap_completed",
+        [
+            (
+                "db_path",
+                infrastructure.sqlite.database_path.display().to_string(),
+            ),
+            ("api_base_path", config.api.base_path.clone()),
+            ("web_mount_path", config.web.mount_path.clone()),
+            (
+                "recovered_jobs",
+                startup_recovery.recovered_jobs.len().to_string(),
+            ),
+        ],
+    );
 
     Ok(Runtime {
-        application: ApplicationContext::new(&config),
+        application,
         api: ApiSurface::from_config(&config.api),
         web: WebSurface::from_config(&config.web),
         infrastructure,
@@ -80,6 +99,7 @@ fn bootstrap_at(
 fn recover_startup_jobs(
     database_path: &std::path::Path,
     recovered_at_unix_seconds: i64,
+    application: &ApplicationContext,
 ) -> Result<StartupRecoveryReport, RuntimeBootstrapError> {
     let context = SqliteRepositoryContext::open(database_path.to_path_buf())
         .map_err(|error| RuntimeBootstrapError::Storage(error.message))?;
@@ -90,6 +110,11 @@ fn recover_startup_jobs(
     let recovered_jobs = JobService::new(repositories)
         .recover_unfinished_jobs(recovered_at_unix_seconds)
         .map_err(|error| RuntimeBootstrapError::Storage(error.message))?;
+    application.observability.metrics.set_gauge(
+        "startup_recovered_jobs",
+        crate::application::observability::labels([]),
+        recovered_jobs.len() as f64,
+    );
     Ok(StartupRecoveryReport { recovered_jobs })
 }
 

@@ -8,6 +8,7 @@ pub mod issues;
 pub mod jobs;
 pub mod manual_metadata;
 pub mod matching;
+pub mod observability;
 pub mod organize;
 pub mod pipeline;
 pub mod recovery;
@@ -17,4 +18,5 @@ pub mod tagging;
 pub mod workers;
 
 pub use config::ValidatedRuntimeConfig;
+pub use observability::{LogLevel, ObservabilityContext};
 pub use services::ApplicationContext;

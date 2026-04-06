@@ -12,6 +12,7 @@ use crate::application::matching::{
     DiscogsMetadataProvider, MatchingServiceError, MusicBrainzMetadataProvider,
     ReleaseMatchingService,
 };
+use crate::application::observability::{LogLevel, ObservabilityContext, issue_type_name, labels};
 use crate::application::organize::{FileOrganizationService, OrganizationError};
 use crate::application::recovery::{RecoveryError, RecoveryService};
 use crate::application::repository::{
@@ -31,6 +32,7 @@ use crate::domain::job::{Job, JobStatus, JobSubject, JobTrigger, JobType};
 use crate::domain::release_instance::ReleaseInstanceState;
 use crate::support::ids::{ImportBatchId, JobId, ReleaseInstanceId};
 use crate::support::pagination::PageRequest;
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineRunReport {
@@ -56,6 +58,7 @@ pub struct JobPipelineService<R, P> {
     repository: R,
     provider: P,
     config: ValidatedRuntimeConfig,
+    observability: ObservabilityContext,
     workers: WorkerPools,
 }
 
@@ -64,12 +67,14 @@ impl<R, P> JobPipelineService<R, P> {
         repository: R,
         provider: P,
         config: ValidatedRuntimeConfig,
+        observability: ObservabilityContext,
         workers: WorkerPools,
     ) -> Self {
         Self {
             repository,
             provider,
             config,
+            observability,
             workers,
         }
     }
@@ -110,6 +115,8 @@ where
         changed_at_unix_seconds: i64,
     ) -> Result<PipelineRunReport, PipelineError> {
         let job = self.load_job(job_id)?;
+        let started_at = Instant::now();
+        self.emit_job_event(LogLevel::Info, "job_started", &job, Vec::new());
         let _permit = self
             .workers
             .pool(pool_kind_for_job(&job.job_type))
@@ -152,6 +159,12 @@ where
                 let completed = jobs
                     .complete_job(job_id, phase, changed_at_unix_seconds)
                     .map_err(map_job_service_error)?;
+                self.record_job_completion(
+                    &completed,
+                    "succeeded",
+                    started_at.elapsed().as_secs_f64(),
+                );
+                self.refresh_operational_gauges();
                 Ok(PipelineRunReport {
                     job: completed,
                     queued_jobs,
@@ -168,6 +181,8 @@ where
                         changed_at_unix_seconds,
                     )
                     .map_err(map_job_service_error)?;
+                self.record_job_completion(&failed, "failed", started_at.elapsed().as_secs_f64());
+                self.refresh_operational_gauges();
                 Err(PipelineError {
                     kind: map_pipeline_kind(&error.kind),
                     message: format!(
@@ -202,6 +217,17 @@ where
         WatchDiscoveryService::new(self.repository.clone(), self.config.clone())
             .analyze_import_batch(&batch_id, changed_at_unix_seconds)
             .map_err(map_watch_error)?;
+        self.observability
+            .metrics
+            .increment_counter("imports_total", labels([("outcome", "grouped")]));
+        self.observability.emit(
+            LogLevel::Info,
+            "import_batch_grouped",
+            [
+                ("import_batch_id", batch_id.as_uuid().to_string()),
+                ("job_id", job.id.as_uuid().to_string()),
+            ],
+        );
 
         let queued = self.enqueue_job_once(
             JobType::MatchReleaseInstance,
@@ -221,6 +247,9 @@ where
         WatchDiscoveryService::new(self.repository.clone(), self.config.clone())
             .analyze_import_batch(&batch_id, changed_at_unix_seconds)
             .map_err(map_watch_error)?;
+        self.observability
+            .metrics
+            .increment_counter("imports_total", labels([("outcome", "grouped")]));
         let queued = self.enqueue_job_once(
             JobType::MatchReleaseInstance,
             JobSubject::ImportBatch(batch_id),
@@ -276,6 +305,31 @@ where
                 changed_at_unix_seconds,
             )
             .map_err(map_duplicate_error)?;
+        if !duplicate_report.duplicates.is_empty() {
+            self.observability.metrics.increment_counter(
+                "duplicate_detections_total",
+                labels([(
+                    "result",
+                    if duplicate_report.quarantined {
+                        "quarantined"
+                    } else {
+                        "flagged"
+                    },
+                )]),
+            );
+            self.observability.emit(
+                LogLevel::Warn,
+                "duplicate_detected",
+                [
+                    ("job_id", job.id.as_uuid().to_string()),
+                    (
+                        "release_instance_id",
+                        release_instance_id.as_uuid().to_string(),
+                    ),
+                    ("duplicates", duplicate_report.duplicates.len().to_string()),
+                ],
+            );
+        }
         if duplicate_report.quarantined {
             self.update_release_instance_state(
                 &release_instance_id,
@@ -353,7 +407,7 @@ where
     ) -> Result<Vec<Job>, StageFailure> {
         let release_instance_id = resolve_release_instance_subject(&job.subject)?;
         self.update_release_instance_state(&release_instance_id, ReleaseInstanceState::Organizing)?;
-        FileOrganizationService::new(self.repository.clone())
+        let report = FileOrganizationService::new(self.repository.clone())
             .organize_release_instance(
                 &self.config.storage,
                 &self.config.export,
@@ -361,6 +415,27 @@ where
             )
             .await
             .map_err(map_organization_error)?;
+        self.observability.metrics.add_counter(
+            "file_operations_total",
+            labels([
+                ("mode", import_mode_name(&report.mode)),
+                ("result", "succeeded"),
+            ]),
+            report.organized_files.len() as f64,
+        );
+        self.observability.emit(
+            LogLevel::Info,
+            "managed_files_organized",
+            [
+                ("job_id", job.id.as_uuid().to_string()),
+                (
+                    "release_instance_id",
+                    release_instance_id.as_uuid().to_string(),
+                ),
+                ("file_count", report.organized_files.len().to_string()),
+                ("mode", import_mode_name(&report.mode).to_string()),
+            ],
+        );
         ArtworkService::new(self.repository.clone())
             .export_primary_artwork(
                 &self.config.storage,
@@ -388,6 +463,27 @@ where
             .verify_release_instance(&release_instance_id, changed_at_unix_seconds)
             .await
             .map_err(map_compatibility_error)?;
+        if !report.verified {
+            self.observability.metrics.add_counter(
+                "compatibility_verification_failures_total",
+                labels([("result", "failed")]),
+                report.issue_types.len() as f64,
+            );
+            for issue_type in &report.issue_types {
+                self.observability.emit(
+                    LogLevel::Warn,
+                    "compatibility_verification_failed",
+                    [
+                        ("job_id", job.id.as_uuid().to_string()),
+                        (
+                            "release_instance_id",
+                            release_instance_id.as_uuid().to_string(),
+                        ),
+                        ("issue_type", issue_type_name(issue_type).to_string()),
+                    ],
+                );
+            }
+        }
         if report.verified {
             self.update_release_instance_state(
                 &release_instance_id,
@@ -429,6 +525,26 @@ where
         let report = RecoveryService::new(self.repository.clone(), self.config.clone())
             .rescan_watcher(scan_subject, changed_at_unix_seconds)
             .map_err(map_recovery_error)?;
+        self.observability.metrics.add_counter(
+            "imports_total",
+            labels([("outcome", "discovered")]),
+            report.created_batches.len() as f64,
+        );
+        self.observability.metrics.add_counter(
+            "imports_total",
+            labels([("outcome", "skipped_active")]),
+            report.skipped_paths.len() as f64,
+        );
+        self.observability.emit(
+            LogLevel::Info,
+            "watcher_rescanned",
+            [
+                ("job_id", job.id.as_uuid().to_string()),
+                ("source_path", scan_subject.to_string()),
+                ("created_batches", report.created_batches.len().to_string()),
+                ("skipped_paths", report.skipped_paths.len().to_string()),
+            ],
+        );
         Ok(report.queued_jobs)
     }
 
@@ -459,6 +575,10 @@ where
                 .map_err(map_issue_service_error)?;
             }
             (JobType::OrganizeFiles, JobSubject::ReleaseInstance(release_instance_id)) => {
+                self.observability.metrics.increment_counter(
+                    "file_operations_total",
+                    labels([("mode", "unknown"), ("result", "failed")]),
+                );
                 self.update_release_instance_state(
                     release_instance_id,
                     ReleaseInstanceState::Failed,
@@ -484,6 +604,12 @@ where
             }
             _ => {}
         }
+        self.emit_job_event(
+            LogLevel::Error,
+            "job_stage_failed",
+            job,
+            vec![("message".to_string(), error.message.clone())],
+        );
         Ok(())
     }
 
@@ -495,6 +621,73 @@ where
                 kind: PipelineErrorKind::NotFound,
                 message: format!("job {} was not found", job_id.as_uuid()),
             })
+    }
+
+    fn record_job_completion(&self, job: &Job, status: &str, duration_seconds: f64) {
+        self.observability.metrics.increment_counter(
+            "jobs_total",
+            labels([("type", job_type_name(&job.job_type)), ("status", status)]),
+        );
+        self.observability.metrics.observe_duration_seconds(
+            "job_duration_seconds",
+            labels([("type", job_type_name(&job.job_type))]),
+            duration_seconds,
+        );
+        self.emit_job_event(
+            if status == "succeeded" {
+                LogLevel::Info
+            } else {
+                LogLevel::Error
+            },
+            if status == "succeeded" {
+                "job_completed"
+            } else {
+                "job_failed"
+            },
+            job,
+            vec![("status".to_string(), status.to_string())],
+        );
+    }
+
+    fn emit_job_event(
+        &self,
+        level: LogLevel,
+        event: &str,
+        job: &Job,
+        extra_fields: Vec<(String, String)>,
+    ) {
+        let mut fields = vec![
+            ("job_id".to_string(), job.id.as_uuid().to_string()),
+            (
+                "job_type".to_string(),
+                job_type_name(&job.job_type).to_string(),
+            ),
+        ];
+        match &job.subject {
+            JobSubject::ImportBatch(batch_id) => {
+                fields.push((
+                    "import_batch_id".to_string(),
+                    batch_id.as_uuid().to_string(),
+                ));
+            }
+            JobSubject::ReleaseInstance(release_instance_id) => {
+                fields.push((
+                    "release_instance_id".to_string(),
+                    release_instance_id.as_uuid().to_string(),
+                ));
+            }
+            JobSubject::SourceScan(scan_subject) => {
+                fields.push(("source_path".to_string(), scan_subject.clone()));
+            }
+        }
+        fields.extend(extra_fields);
+        self.observability.emit(level, event, fields);
+    }
+
+    fn refresh_operational_gauges(&self) {
+        self.observability.sync_issue_gauges(&self.repository);
+        self.observability
+            .sync_release_instance_state_gauges(&self.repository);
     }
 
     fn update_release_instance_state(
@@ -935,6 +1128,14 @@ fn map_compatibility_error(error: CompatibilityVerificationError) -> StageFailur
     }
 }
 
+fn import_mode_name(value: &crate::domain::import_batch::ImportMode) -> &'static str {
+    match value {
+        crate::domain::import_batch::ImportMode::Copy => "copy",
+        crate::domain::import_batch::ImportMode::Move => "move",
+        crate::domain::import_batch::ImportMode::Hardlink => "hardlink",
+    }
+}
+
 fn map_recovery_error(error: RecoveryError) -> StageFailure {
     StageFailure {
         kind: match error.kind {
@@ -1085,6 +1286,7 @@ mod tests {
             repository.clone(),
             FakePipelineProvider::default(),
             ValidatedRuntimeConfig::from_validated_app_config(&AppConfig::default()),
+            crate::application::observability::ObservabilityContext::default(),
             WorkerPools::from_config(&AppConfig::default().workers),
         );
 
@@ -1142,6 +1344,7 @@ mod tests {
             repository.clone(),
             FakePipelineProvider::default(),
             validated,
+            crate::application::observability::ObservabilityContext::default(),
             WorkerPools::from_config(&config.workers),
         );
         let render_job = repository.insert_job(Job::queued(
@@ -1221,6 +1424,7 @@ mod tests {
             repository.clone(),
             FakePipelineProvider::default(),
             ValidatedRuntimeConfig::from_validated_app_config(&AppConfig::default()),
+            crate::application::observability::ObservabilityContext::default(),
             WorkerPools::from_config(&AppConfig::default().workers),
         );
         let write_job = repository.insert_job(Job::queued(
@@ -1274,6 +1478,7 @@ mod tests {
             repository.clone(),
             FakePipelineProvider::default(),
             ValidatedRuntimeConfig::from_validated_app_config(&config),
+            crate::application::observability::ObservabilityContext::default(),
             WorkerPools::from_config(&config.workers),
         );
         let enrich_job = repository.insert_job(Job::queued(
@@ -1326,6 +1531,7 @@ mod tests {
             repository.clone(),
             FakePipelineProvider::default(),
             ValidatedRuntimeConfig::from_validated_app_config(&config),
+            crate::application::observability::ObservabilityContext::default(),
             WorkerPools::from_config(&config.workers),
         );
         let reprocess_job = repository.insert_job(Job::queued(
@@ -1384,6 +1590,7 @@ mod tests {
             repository.clone(),
             FakePipelineProvider::default(),
             ValidatedRuntimeConfig::from_validated_app_config(&config),
+            crate::application::observability::ObservabilityContext::default(),
             WorkerPools::from_config(&config.workers),
         );
         let rescan_job = repository.insert_job(Job::queued(

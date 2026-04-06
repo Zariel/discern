@@ -10,6 +10,7 @@ use tokio::time::sleep;
 use crate::application::matching::{
     DiscogsMetadataProvider, DiscogsReleaseCandidate, DiscogsReleaseQuery,
 };
+use crate::application::observability::{LogLevel, ObservabilityContext, labels};
 use crate::config::DiscogsConfig;
 
 const DEFAULT_BASE_URL: &str = "https://api.discogs.com";
@@ -22,6 +23,7 @@ pub struct DiscogsClient {
     http: reqwest::Client,
     min_interval: Duration,
     state: Arc<Mutex<ClientState>>,
+    observability: Option<ObservabilityContext>,
 }
 
 #[derive(Debug)]
@@ -48,11 +50,19 @@ pub struct DiscogsError {
 
 impl DiscogsClient {
     pub fn from_config(config: &DiscogsConfig) -> Self {
+        Self::from_config_with_observability(config, None)
+    }
+
+    pub fn from_config_with_observability(
+        config: &DiscogsConfig,
+        observability: Option<ObservabilityContext>,
+    ) -> Self {
         Self::new(
             DEFAULT_BASE_URL,
             config.enabled,
             config.personal_access_token.clone(),
             config.rate_limit_per_second,
+            observability,
         )
         .expect("discogs client should construct")
     }
@@ -62,6 +72,7 @@ impl DiscogsClient {
         enabled: bool,
         personal_access_token: Option<String>,
         rate_limit_per_second: u16,
+        observability: Option<ObservabilityContext>,
     ) -> Result<Self, DiscogsError> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let mut headers = HeaderMap::new();
@@ -88,6 +99,7 @@ impl DiscogsClient {
             http,
             min_interval: Duration::from_secs_f64(1.0 / f64::from(rate_limit_per_second.max(1))),
             state: Arc::new(Mutex::new(ClientState::default())),
+            observability,
         })
     }
 
@@ -97,6 +109,7 @@ impl DiscogsClient {
         limit: u8,
     ) -> Result<Vec<DiscogsReleaseCandidate>, DiscogsError> {
         if !self.enabled {
+            self.record_provider_result("disabled", "/database/search");
             return Ok(Vec::new());
         }
         let mut params = vec![
@@ -151,6 +164,7 @@ impl DiscogsClient {
         {
             let state = self.state.lock().await;
             if let Some(body) = state.cache.get(&cache_key) {
+                self.record_provider_result("cache_hit", path);
                 return Ok(body.clone());
             }
         }
@@ -168,16 +182,23 @@ impl DiscogsClient {
             .await
             .map_err(|error| DiscogsError {
                 message: format!("Discogs request failed: {error}"),
-            })?;
+            })
+            .inspect_err(|_| self.record_provider_result("request_error", path))?;
         let status = response.status();
-        let body = response.text().await.map_err(|error| DiscogsError {
-            message: format!("failed to read Discogs response body: {error}"),
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|error| DiscogsError {
+                message: format!("failed to read Discogs response body: {error}"),
+            })
+            .inspect_err(|_| self.record_provider_result("request_error", path))?;
         if !status.is_success() {
+            self.record_provider_result("http_error", path);
             return Err(DiscogsError {
                 message: format!("Discogs request returned {status}: {body}"),
             });
         }
+        self.record_provider_result("success", path);
         let mut state = self.state.lock().await;
         state.cache.insert(cache_key.clone(), body.clone());
         state.cache_order.push_back(cache_key);
@@ -198,7 +219,36 @@ impl DiscogsClient {
             wait
         };
         if !wait.is_zero() {
+            if let Some(observability) = &self.observability {
+                observability.metrics.increment_counter(
+                    "metadata_provider_rate_limit_hits_total",
+                    labels([("provider", "discogs")]),
+                );
+                observability.emit(
+                    LogLevel::Warn,
+                    "provider_rate_limit_wait",
+                    [("provider", "discogs"), ("path", "/database/search")],
+                );
+            }
             sleep(wait).await;
+        }
+    }
+
+    fn record_provider_result(&self, result: &str, path: &str) {
+        if let Some(observability) = &self.observability {
+            observability.metrics.increment_counter(
+                "metadata_provider_requests_total",
+                labels([("provider", "discogs"), ("result", result)]),
+            );
+            observability.emit(
+                if matches!(result, "success" | "cache_hit" | "disabled") {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Warn
+                },
+                "provider_request",
+                [("provider", "discogs"), ("result", result), ("path", path)],
+            );
         }
     }
 }
@@ -311,6 +361,7 @@ mod tests {
             true,
             Some("token".to_string()),
             2,
+            None,
         )
         .expect("client should build");
         let results = client

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 id3 = "1.16.3"
 metaflac = "0.2.8"
+prometheus-client = "0.24.1"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
