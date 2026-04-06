@@ -1,4 +1,5 @@
 pub mod client;
+pub mod inspect;
 pub mod operate;
 pub mod shell;
 
@@ -7,6 +8,10 @@ use std::path::PathBuf;
 use crate::config::{ApiConfig, WebConfig};
 
 pub use client::{WebApiClient, WebApiPaths};
+pub use inspect::{
+    LibrarySearchFilters, LibrarySearchScreen, LibrarySearchScreenLoader, ReleaseDetailScreen,
+    ReleaseDetailScreenLoader, ReleaseInstanceDetailScreen, ReleaseInstanceDetailScreenLoader,
+};
 pub use operate::{
     IssueQueueActionRequest, IssueQueueFilters, IssueQueueScreen, IssueQueueScreenLoader,
     IssueQueueSummary, JobsScreen, JobsScreenFilters, JobsScreenLoader, JobsScreenSummary,

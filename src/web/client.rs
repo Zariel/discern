@@ -41,6 +41,10 @@ impl WebApiPaths {
         format!("{}/{}", self.releases, release_id)
     }
 
+    pub fn search_release_groups(&self) -> String {
+        self.release_groups.clone()
+    }
+
     pub fn release_instance(&self, release_instance_id: &str) -> String {
         format!("{}/{}", self.release_instances, release_instance_id)
     }
@@ -98,6 +102,8 @@ mod tests {
             client.paths.candidate_matches("relinst_123"),
             "/api/release-instances/relinst_123/candidate-matches"
         );
+        assert_eq!(client.paths.search_release_groups(), "/api/release-groups");
+        assert_eq!(client.paths.release("rel_123"), "/api/releases/rel_123");
         assert_eq!(
             client.paths.resolve_issue("issue_123"),
             "/api/issues/issue_123/resolve"
