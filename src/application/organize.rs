@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use tokio::task;
 
 use crate::application::config::{ExportPolicy, PathPolicy, StoragePolicy};
+use crate::application::filesystem;
 use crate::application::repository::{
     ExportRepository, ImportBatchRepository, ReleaseInstanceCommandRepository,
     ReleaseInstanceRepository, ReleaseRepository, RepositoryError, RepositoryErrorKind,
@@ -297,13 +298,26 @@ fn execute_file_operations(
     mode: &ImportMode,
 ) -> Result<Vec<VerifiedFile>, OrganizationError> {
     let mut verified = Vec::with_capacity(plans.len());
+    filesystem::ensure_managed_root(managed_root).map_err(|error| OrganizationError {
+        kind: OrganizationErrorKind::Storage,
+        message: format!(
+            "failed to validate managed root {}: {error}",
+            managed_root.display()
+        ),
+    })?;
     for plan in plans {
-        if let Some(parent) = plan.target_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| OrganizationError {
+        filesystem::assert_safe_source_file(&plan.source_path, "source file").map_err(|error| {
+            OrganizationError {
                 kind: OrganizationErrorKind::Storage,
-                message: format!("failed to create {}: {error}", parent.display()),
-            })?;
-        }
+                message: error.to_string(),
+            }
+        })?;
+        filesystem::ensure_safe_target_parent(managed_root, &plan.target_path).map_err(
+            |error| OrganizationError {
+                kind: OrganizationErrorKind::Conflict,
+                message: error.to_string(),
+            },
+        )?;
 
         let target_exists = plan.target_path.exists();
         if target_exists && !existing_paths.contains(&plan.target_path) {
@@ -319,62 +333,45 @@ fn execute_file_operations(
         if !target_exists {
             match mode {
                 ImportMode::Copy => {
-                    fs::copy(&plan.source_path, &plan.target_path).map_err(|error| {
-                        OrganizationError {
-                            kind: OrganizationErrorKind::Storage,
-                            message: format!(
-                                "failed to copy {} to {}: {error}",
-                                plan.source_path.display(),
-                                plan.target_path.display()
-                            ),
-                        }
+                    filesystem::atomic_copy_into_place(
+                        &plan.source_path,
+                        &plan.target_path,
+                        managed_root,
+                    )
+                    .map_err(|error| OrganizationError {
+                        kind: OrganizationErrorKind::Storage,
+                        message: format!(
+                            "failed to copy {} to {}: {error}",
+                            plan.source_path.display(),
+                            plan.target_path.display()
+                        ),
                     })?;
                 }
                 ImportMode::Hardlink => {
-                    fs::hard_link(&plan.source_path, &plan.target_path).map_err(|error| {
-                        OrganizationError {
-                            kind: OrganizationErrorKind::Storage,
-                            message: format!(
-                                "failed to hardlink {} to {}: {error}",
-                                plan.source_path.display(),
-                                plan.target_path.display()
-                            ),
-                        }
+                    filesystem::atomic_hard_link_into_place(
+                        &plan.source_path,
+                        &plan.target_path,
+                        managed_root,
+                    )
+                    .map_err(|error| OrganizationError {
+                        kind: OrganizationErrorKind::Storage,
+                        message: format!(
+                            "failed to hardlink {} to {}: {error}",
+                            plan.source_path.display(),
+                            plan.target_path.display()
+                        ),
                     })?;
                 }
                 ImportMode::Move => {
-                    if let Err(error) = fs::rename(&plan.source_path, &plan.target_path) {
-                        if error.raw_os_error() == Some(18) {
-                            fs::copy(&plan.source_path, &plan.target_path).map_err(|copy_error| {
-                                OrganizationError {
-                                    kind: OrganizationErrorKind::Storage,
-                                    message: format!(
-                                        "failed to copy {} to {} during cross-device move: {copy_error}",
-                                        plan.source_path.display(),
-                                        plan.target_path.display()
-                                    ),
-                                }
-                            })?;
-                            fs::remove_file(&plan.source_path).map_err(|remove_error| {
-                                OrganizationError {
-                                    kind: OrganizationErrorKind::Storage,
-                                    message: format!(
-                                        "failed to remove {} after cross-device move: {remove_error}",
-                                        plan.source_path.display()
-                                    ),
-                                }
-                            })?;
-                        } else {
-                            return Err(OrganizationError {
-                                kind: OrganizationErrorKind::Storage,
-                                message: format!(
-                                    "failed to move {} to {}: {error}",
-                                    plan.source_path.display(),
-                                    plan.target_path.display()
-                                ),
-                            });
-                        }
-                    }
+                    filesystem::move_into_place(&plan.source_path, &plan.target_path, managed_root)
+                        .map_err(|error| OrganizationError {
+                            kind: OrganizationErrorKind::Storage,
+                            message: format!(
+                                "failed to move {} to {}: {error}",
+                                plan.source_path.display(),
+                                plan.target_path.display()
+                            ),
+                        })?;
                 }
             }
         }
@@ -910,6 +907,74 @@ mod tests {
 
         assert!(report.organized_files[0].exists());
         assert!(!source_path.exists());
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_rejects_symlinked_source_files() {
+        let temp_root = test_root("organize-source-symlink");
+        let source_root = temp_root.join("incoming");
+        fs::create_dir_all(&source_root).expect("source root should exist");
+        let source_file = source_root.join("01 - Track.flac");
+        fs::write(&source_file, b"flac-data").expect("source file should exist");
+        let symlink_path = source_root.join("01 - Track-symlink.flac");
+        std::os::unix::fs::symlink(&source_file, &symlink_path).expect("symlink should exist");
+
+        let repository =
+            InMemoryOrganizationRepository::new(ImportMode::Copy, vec![symlink_path.clone()]);
+        let mut config =
+            ValidatedRuntimeConfig::from_validated_app_config(&crate::config::AppConfig::default());
+        config.storage.managed_library_root = temp_root.join("managed");
+        let service = FileOrganizationService::new(repository);
+
+        let error = service
+            .organize_release_instance(
+                &config.storage,
+                &config.export,
+                &service.repository.release_instance.id,
+            )
+            .await
+            .expect_err("symlinked source should fail");
+
+        assert_eq!(error.kind, OrganizationErrorKind::Storage);
+        assert!(error.message.contains("symlink"));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_rejects_symlinked_managed_roots() {
+        let temp_root = test_root("organize-managed-symlink");
+        let source_root = temp_root.join("incoming");
+        let outside_root = temp_root.join("outside");
+        fs::create_dir_all(&source_root).expect("source root should exist");
+        fs::create_dir_all(&outside_root).expect("outside root should exist");
+        let source_path = source_root.join("01 - Track.flac");
+        fs::write(&source_path, b"flac-data").expect("source file should exist");
+
+        let managed_symlink = temp_root.join("managed");
+        std::os::unix::fs::symlink(&outside_root, &managed_symlink)
+            .expect("managed symlink should exist");
+
+        let repository =
+            InMemoryOrganizationRepository::new(ImportMode::Copy, vec![source_path.clone()]);
+        let mut config =
+            ValidatedRuntimeConfig::from_validated_app_config(&crate::config::AppConfig::default());
+        config.storage.managed_library_root = managed_symlink;
+        let service = FileOrganizationService::new(repository);
+
+        let error = service
+            .organize_release_instance(
+                &config.storage,
+                &config.export,
+                &service.repository.release_instance.id,
+            )
+            .await
+            .expect_err("symlinked managed root should fail");
+
+        assert_eq!(error.kind, OrganizationErrorKind::Storage);
+        assert!(error.message.contains("symlink"));
 
         let _ = fs::remove_dir_all(temp_root);
     }

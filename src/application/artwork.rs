@@ -1,7 +1,7 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::application::config::{ExportPolicy, StoragePolicy};
+use crate::application::filesystem;
 use crate::application::repository::{
     ExportRepository, IssueCommandRepository, IssueListQuery, IssueRepository,
     ManualOverrideListQuery, ManualOverrideRepository, ReleaseArtworkCommandRepository,
@@ -165,8 +165,12 @@ where
                         message: format!("artwork {} had no source path", artwork.id.as_uuid()),
                     })?;
             let target_path = managed_directory.join(file_name);
-            fs::create_dir_all(&storage.managed_library_root).map_err(storage_error)?;
-            fs::copy(original_path, &target_path).map_err(storage_error)?;
+            filesystem::atomic_copy_into_place(
+                original_path,
+                &target_path,
+                &storage.managed_library_root,
+            )
+            .map_err(storage_error)?;
             Some(target_path)
         } else {
             None
@@ -410,6 +414,7 @@ fn storage_error(error: std::io::Error) -> ArtworkExportError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::{Arc, Mutex};
 
     use crate::application::repository::{
@@ -447,6 +452,13 @@ mod tests {
                 &crate::config::AppConfig::default(),
             )
             .storage;
+        let root = PathBuf::from(&repository.release_instance.provenance.original_source_path)
+            .parent()
+            .and_then(Path::parent)
+            .expect("managed root parent should exist")
+            .to_path_buf();
+        let mut storage = storage;
+        storage.managed_library_root = root.join("managed");
 
         let report = ArtworkService::new(repository.clone())
             .export_primary_artwork(&storage, &export, &repository.release_instance.id, 200)
@@ -483,6 +495,13 @@ mod tests {
                 &crate::config::AppConfig::default(),
             )
             .storage;
+        let root = PathBuf::from(&repository.release_instance.provenance.original_source_path)
+            .parent()
+            .and_then(Path::parent)
+            .expect("managed root parent should exist")
+            .to_path_buf();
+        let mut storage = storage;
+        storage.managed_library_root = root.join("managed");
 
         let report = ArtworkService::new(repository.clone())
             .export_primary_artwork(&storage, &export, &repository.release_instance.id, 200)
@@ -490,6 +509,41 @@ mod tests {
 
         assert!(report.selected_artwork.is_none());
         assert!(repository.has_open_missing_artwork_issue());
+    }
+
+    #[test]
+    fn rejects_symlinked_artwork_sources() {
+        let repository = InMemoryArtworkRepository::seeded(true, true);
+        let export = crate::application::config::ValidatedRuntimeConfig::from_validated_app_config(
+            &crate::config::AppConfig::default(),
+        )
+        .export;
+        let storage =
+            crate::application::config::ValidatedRuntimeConfig::from_validated_app_config(
+                &crate::config::AppConfig::default(),
+            )
+            .storage;
+        let root = PathBuf::from(&repository.release_instance.provenance.original_source_path)
+            .parent()
+            .and_then(Path::parent)
+            .expect("managed root parent should exist")
+            .to_path_buf();
+        let mut storage = storage;
+        storage.managed_library_root = root.join("managed");
+        let original_path = root.join("imports/album/folder.jpg");
+        let symlink_path = original_path.with_file_name("cover-symlink.jpg");
+        std::os::unix::fs::symlink(&original_path, &symlink_path)
+            .expect("symlink should be created");
+        repository.replace_candidate_artwork_path(&original_path, symlink_path.clone());
+
+        let error = ArtworkService::new(repository.clone())
+            .export_primary_artwork(&storage, &export, &repository.release_instance.id, 200)
+            .expect_err("symlinked artwork source should fail");
+
+        assert_eq!(error.kind, ArtworkExportErrorKind::Storage);
+        assert!(error.message.contains("symlink"));
+
+        let _ = fs::remove_file(symlink_path);
     }
 
     #[derive(Clone)]
@@ -634,6 +688,24 @@ mod tests {
                     checksum: None,
                     size_bytes: 10,
                 }])),
+            }
+        }
+
+        fn replace_candidate_artwork_path(&self, original: &Path, replacement: PathBuf) {
+            let mut manifests = self.manifests.lock().expect("manifests should lock");
+            for manifest in manifests.iter_mut() {
+                for file in &mut manifest.auxiliary_files {
+                    if file.path == original {
+                        file.path = replacement.clone();
+                    }
+                }
+                for group in &mut manifest.grouping.groups {
+                    for path in &mut group.auxiliary_paths {
+                        if path == original {
+                            *path = replacement.clone();
+                        }
+                    }
+                }
             }
         }
 

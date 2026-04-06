@@ -3,6 +3,7 @@ pub mod compatibility;
 pub mod config;
 pub mod duplicates;
 pub mod export;
+pub mod filesystem;
 pub mod ingest;
 pub mod issues;
 pub mod jobs;
