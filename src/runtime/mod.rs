@@ -89,7 +89,7 @@ fn bootstrap_at(
     Ok(Runtime {
         application,
         api: ApiSurface::from_config(&config.api),
-        web: WebSurface::from_config(&config.web),
+        web: WebSurface::from_config_with_api(&config.web, &config.api),
         infrastructure,
         startup_recovery,
         config,
@@ -150,6 +150,11 @@ mod tests {
 
         assert_eq!(runtime.api.base_path, "/api");
         assert_eq!(runtime.web.mount_path, "/");
+        assert_eq!(runtime.web.api_client.paths.jobs, "/api/jobs");
+        assert_eq!(
+            runtime.web.shell.default_route,
+            crate::web::ShellRoute::IssueQueue
+        );
         assert!(runtime.application.config.diagnostics.is_empty());
         assert_eq!(
             runtime.application.config.import.default_mode,
