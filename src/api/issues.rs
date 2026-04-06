@@ -407,10 +407,10 @@ mod tests {
     use crate::domain::exported_metadata_snapshot::{
         CompatibilityReport, ExportedMetadataSnapshot, QualifierVisibility,
     };
-    use std::collections::HashMap;
     use crate::domain::issue::{Issue, IssueSubject, IssueType};
     use crate::support::ids::{ExportedMetadataSnapshotId, ReleaseInstanceId};
     use crate::support::pagination::Page;
+    use std::collections::HashMap;
 
     use super::*;
 
