@@ -1,6 +1,7 @@
 pub mod client;
 pub mod inspect;
 pub mod operate;
+pub mod review;
 pub mod shell;
 
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ pub use operate::{
     IssueQueueActionRequest, IssueQueueFilters, IssueQueueScreen, IssueQueueScreenLoader,
     IssueQueueSummary, JobsScreen, JobsScreenFilters, JobsScreenLoader, JobsScreenSummary,
 };
+pub use review::{CandidateReviewFilters, CandidateReviewScreen, CandidateReviewScreenLoader};
 pub use shell::{ShellNavGroup, ShellNavItem, ShellRoute, WebShell};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

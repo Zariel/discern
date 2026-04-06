@@ -63,6 +63,28 @@ impl WebApiPaths {
         )
     }
 
+    pub fn select_candidate_match(&self, release_instance_id: &str, candidate_id: &str) -> String {
+        format!(
+            "{}/{}/select",
+            self.candidate_matches(release_instance_id),
+            candidate_id
+        )
+    }
+
+    pub fn resolve_match(&self, release_instance_id: &str) -> String {
+        format!(
+            "{}/{}/resolve-match",
+            self.release_instances, release_instance_id
+        )
+    }
+
+    pub fn track_instance(&self, release_instance_id: &str, track_instance_id: &str) -> String {
+        format!(
+            "{}/{}/tracks/{}",
+            self.release_instances, release_instance_id, track_instance_id
+        )
+    }
+
     pub fn issue(&self, issue_id: &str) -> String {
         format!("{}/{}", self.issues, issue_id)
     }
@@ -102,8 +124,22 @@ mod tests {
             client.paths.candidate_matches("relinst_123"),
             "/api/release-instances/relinst_123/candidate-matches"
         );
+        assert_eq!(
+            client
+                .paths
+                .select_candidate_match("relinst_123", "cand_123"),
+            "/api/release-instances/relinst_123/candidate-matches/cand_123/select"
+        );
         assert_eq!(client.paths.search_release_groups(), "/api/release-groups");
         assert_eq!(client.paths.release("rel_123"), "/api/releases/rel_123");
+        assert_eq!(
+            client.paths.resolve_match("relinst_123"),
+            "/api/release-instances/relinst_123/resolve-match"
+        );
+        assert_eq!(
+            client.paths.track_instance("relinst_123", "trackinst_123"),
+            "/api/release-instances/relinst_123/tracks/trackinst_123"
+        );
         assert_eq!(
             client.paths.resolve_issue("issue_123"),
             "/api/issues/issue_123/resolve"
